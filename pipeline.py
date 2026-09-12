@@ -545,8 +545,8 @@ def fetch_frex():
     try:
         tms_ensure_authenticated()
         today = date.today()
-        date_start = (today - timedelta(days=7)).isoformat()
-        date_end = (today + timedelta(days=1)).isoformat()
+        date_start = (today - timedelta(days=5)).isoformat()
+        date_end = today.isoformat()
         print(f"[Frex] window: {date_start} to {date_end}")
         rows = tms_fetch_range(date_start, date_end)
     except Exception as e:
@@ -559,6 +559,14 @@ def fetch_frex():
         return None, "Successful (No New Data)"
 
     df = pd.DataFrame(rows)
+
+    if "id" in df.columns:
+        before = len(df)
+        df = df.drop_duplicates(subset="id", keep="last")
+        if len(df) != before:
+            print(f"[Frex] dropped {before - len(df)} duplicate row(s) by 'id' "
+                  f"(expected when the table changes mid-pagination).")
+
     return df, None
 
 
