@@ -1,10 +1,7 @@
 name: Sync Fulfillment & Frex Data
 
 on:
-  schedule:
-    # Runs every day at 23:00 UTC (06:00 WIB next day). Adjust as needed.
-    - cron: "0 23 * * *"
-  workflow_dispatch: {}   # allows manual "Run workflow" from the Actions tab
+  workflow_dispatch: {}   # manual only - trigger from the Actions tab
 
 jobs:
   sync:
