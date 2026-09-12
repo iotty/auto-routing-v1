@@ -26,8 +26,8 @@ Required secrets / env vars:
                           shared with edit access on the target spreadsheet
   TMS_EMAIL             - Frex TMS login email
   TMS_PASSWORD          - Frex TMS login password
-Optional:
-  SPREADSHEET_ID        - overrides the default spreadsheet id below
+  SPREADSHEET_ID        - the target spreadsheet's ID (from its URL, the
+                          part between /d/ and /edit)
 """
 
 import os
@@ -62,7 +62,6 @@ REQUEST_TIMEOUT = 30
 EXPORT_TIMEOUT = 600          # fulfillment_detail export can be slow
 EXPORT_MAX_RETRIES = 3
 
-DEFAULT_SPREADSHEET_ID = "1XxA_LgepJhqjoPFx5bZNIp0J57ss_uhqjNk6uxs9cYU"
 WAREHOUSE_ID = "7cc6cf47-973c-485c-b605-0e2ae40ec1d6"
 TENANT_ID = "7b25e5bd-f47c-42ae-bf10-660e9fdbf78f"
 REQUEST_ID = "8d3ec4e2-50bb-47c4-a257-f1cc5e635ad1"
@@ -124,7 +123,11 @@ def load_config():
         except OSError:
             pass
 
-    spreadsheet_id = os.environ.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID")
+    if not spreadsheet_id:
+        print("FATAL: env var 'SPREADSHEET_ID' is missing/empty. Set it to the spreadsheet's "
+              "ID from its URL (the part between /d/ and /edit).")
+        sys.exit(1)
     try:
         spreadsheet = gc.open_by_key(spreadsheet_id)
     except gspread.exceptions.SpreadsheetNotFound:
