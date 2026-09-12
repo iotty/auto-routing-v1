@@ -35,6 +35,7 @@ import re
 import sys
 import json
 import time
+import random
 import pickle
 import traceback
 import urllib.parse
@@ -68,7 +69,7 @@ REQUEST_ID = "8d3ec4e2-50bb-47c4-a257-f1cc5e635ad1"
 FF_EXPORT_URL = "https://api.freshfactory.id/v1/admin/exports"
 
 TMS_BASE_HOST = "https://tms.frex.co.id"
-TMS_LOGIN_URL = f"{TMS_BASE_HOST}/login"
+TMS_LOGIN_URL = f"{TMS_BASE_HOST}/en/admin/login"
 TMS_SHIPMENTS_URL = f"{TMS_BASE_HOST}/en/admin/shipments/shipments"
 TMS_COOKIE_JAR_FILE = Path(__file__).parent / "session_cookies.pkl"
 TMS_LOGIN_EMAIL_FIELD = "email"
@@ -164,15 +165,25 @@ FF_HEADERS = {
 FF_SESSION = requests.Session()
 FF_SESSION.headers.update(FF_HEADERS)
 
+TMS_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+TMS_SEC_CH_UA = '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"'
+
+# Base headers a real Chrome browser sends on every request to this site,
+# regardless of whether it's a page navigation or a background XHR call.
+# Per-request Sec-Fetch-* / Accept / Referer are layered on top in
+# tms_login() and tms_fetch_range() to match what a browser actually sends
+# for a top-level navigation vs. an in-page fetch() call.
 TMS_HEADERS = {
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "User-Agent": TMS_USER_AGENT,
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": TMS_SHIPMENTS_URL,
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"
-    ),
-    "X-Requested-With": "XMLHttpRequest",
+    "Accept-Encoding": "gzip, deflate, br",
+    "sec-ch-ua": TMS_SEC_CH_UA,
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Connection": "keep-alive",
 }
 TMS_SESSION = requests.Session()
 TMS_SESSION.headers.update(TMS_HEADERS)
@@ -318,8 +329,33 @@ def tms_load_cookies() -> bool:
 
 
 def tms_login():
-    print("[Frex] logging in fresh...")
-    resp = TMS_SESSION.get(TMS_LOGIN_URL, timeout=30)
+    # A real browser doesn't jump straight to the login endpoint - it lands
+    # on the homepage first, which is also where the session/CSRF cookie
+    # usually first gets set. Mirror that instead of hitting /login cold.
+    nav_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    print(f"[Frex] visiting homepage {TMS_BASE_HOST} ...")
+    TMS_SESSION.get(TMS_BASE_HOST, headers=nav_headers, timeout=30)
+    time.sleep(random.uniform(0.6, 1.4))  # a human doesn't click instantly
+
+    print(f"[Frex] logging in fresh via {TMS_LOGIN_URL} ...")
+    resp = TMS_SESSION.get(
+        TMS_LOGIN_URL,
+        headers={**nav_headers, "Sec-Fetch-Site": "same-origin", "Referer": TMS_BASE_HOST + "/"},
+        timeout=30,
+    )
+    if resp.status_code == 404:
+        raise RuntimeError(
+            f"Login page not found (404) at {TMS_LOGIN_URL}. The TMS login path may have "
+            f"changed - open it in a browser and update TMS_LOGIN_URL in pipeline.py."
+        )
     resp.raise_for_status()
 
     token = None
@@ -334,7 +370,19 @@ def tms_login():
     if token:
         payload[TMS_LOGIN_TOKEN_FIELD] = token
 
-    login_headers = {}
+    time.sleep(random.uniform(0.8, 2.0))  # a human takes a moment to type credentials
+
+    login_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": TMS_BASE_HOST,
+        "Referer": TMS_LOGIN_URL,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
     if "XSRF-TOKEN" in TMS_SESSION.cookies:
         login_headers["X-XSRF-TOKEN"] = urllib.parse.unquote(TMS_SESSION.cookies["XSRF-TOKEN"])
 
@@ -384,6 +432,34 @@ def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
     draw = 1
     total = None
 
+    # A real browser loads the shipments page itself before its JS fires the
+    # first DataTables AJAX call - do the same instead of hitting the AJAX
+    # endpoint as the very first request after login.
+    if allow_relogin:  # only on the outermost call, not on relogin recursion
+        TMS_SESSION.get(
+            TMS_SHIPMENTS_URL,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Referer": TMS_BASE_HOST + "/",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+            },
+            timeout=30,
+        )
+        time.sleep(random.uniform(0.4, 1.0))
+
+    xhr_headers = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": TMS_SHIPMENTS_URL,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
     while total is None or start < total:
         params = tms_build_params(start, page_size, draw, date_start, date_end)
         payload = None
@@ -391,7 +467,7 @@ def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
 
         for attempt in range(1, max_retries + 1):
             try:
-                resp = TMS_SESSION.get(TMS_SHIPMENTS_URL, params=params, timeout=30)
+                resp = TMS_SESSION.get(TMS_SHIPMENTS_URL, params=params, headers=xhr_headers, timeout=30)
             except requests.exceptions.Timeout:
                 last_error = "Request timed out."
             except requests.exceptions.ConnectionError:
@@ -455,6 +531,8 @@ def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
         print(f"[Frex] fetched {len(rows)} / {total}")
         start += page_size
         draw += 1
+        if total is not None and start < total:
+            time.sleep(random.uniform(0.3, 0.8))
 
     if total is not None and len(rows) != total:
         print(f"[Frex] WARNING: fetched {len(rows)} rows but server reported {total}. Data may be incomplete.")
