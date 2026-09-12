@@ -25,4 +25,5 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           TMS_EMAIL: ${{ secrets.TMS_EMAIL }}
           TMS_PASSWORD: ${{ secrets.TMS_PASSWORD }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: python pipeline.py
