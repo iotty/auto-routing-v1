@@ -1,0 +1,31 @@
+name: Sync Fulfillment & Frex Data
+
+on:
+  schedule:
+    # Runs every day at 23:00 UTC (06:00 WIB next day). Adjust as needed.
+    - cron: "0 23 * * *"
+  workflow_dispatch: {}   # allows manual "Run workflow" from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          TMS_EMAIL: ${{ secrets.TMS_EMAIL }}
+          TMS_PASSWORD: ${{ secrets.TMS_PASSWORD }}
+        run: python pipeline.py
