@@ -128,7 +128,21 @@ def load_config():
     try:
         spreadsheet = gc.open_by_key(spreadsheet_id)
     except gspread.exceptions.SpreadsheetNotFound:
-        print(f"FATAL: spreadsheet '{spreadsheet_id}' not found or not shared with the service account.")
+        print(f"FATAL: spreadsheet '{spreadsheet_id}' not found (check SPREADSHEET_ID).")
+        sys.exit(1)
+    except PermissionError as e:
+        service_account_email = service_account_info.get("client_email", "<unknown - check your JSON key>")
+        print(
+            f"FATAL: no permission to open spreadsheet '{spreadsheet_id}' (HTTP 403).\n"
+            f"Fix checklist:\n"
+            f"  1. Open the spreadsheet in your browser, click Share, and add this exact "
+            f"email as Editor:\n     {service_account_email}\n"
+            f"  2. Double-check SPREADSHEET_ID matches the ID in the sheet's URL "
+            f"(the part between /d/ and /edit).\n"
+            f"  3. In Google Cloud Console, confirm 'Google Sheets API' and 'Google Drive API' "
+            f"are both Enabled on the project this service account belongs to.\n"
+            f"Original error: {e}"
+        )
         sys.exit(1)
     except gspread.exceptions.APIError as e:
         print(f"FATAL: failed to open spreadsheet (Sheets API error): {e}")
