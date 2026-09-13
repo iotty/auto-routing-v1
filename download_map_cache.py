@@ -10,34 +10,69 @@ automatically. You can also run it locally if you have internet access:
     pip install osmnx networkx
     python download_map_cache.py
 
-This covers a generous bounding box around your depot, wide enough to
-include the Banten / DKI Jakarta / Jawa Barat border area your deliveries
-fall in. Widen MAP_CACHE_BBOX below if your delivery area expands beyond
-this box in the future - solve_routing.py will fall back to a live Overpass
-fetch automatically for any point outside the cached area, so nothing
-breaks in the meantime, it just won't benefit from the cache for those
-specific runs.
+Widen MAP_CACHE_BBOX below if your delivery area expands beyond this box in
+the future - solve_routing.py will fall back to a live Overpass fetch
+automatically for any point outside the cached area, so nothing breaks in
+the meantime, it just won't benefit from the cache for those specific runs.
 """
 import os
 import sys
+import time
 
 import osmnx as ox
 
-# Generous box around the depot (-6.2393, 106.5353) covering the
-# Tangerang / Jakarta-border delivery area seen in real order data so far.
+# Tight-ish box around the depot (-6.2389, 106.5354), sized to the delivery
+# area actually seen in real order data so far (Tangerang/Serpong/Cisauk),
+# with padding for growth - not the full Jakarta metro area, which is both
+# unnecessary and much more likely to time out against Overpass.
 # (north, south, east, west)
-MAP_CACHE_BBOX = (-6.05, -6.45, 106.80, 106.30)
+MAP_CACHE_BBOX = (-6.05, -6.45, 106.72, 106.30)
+
+# Public Overpass mirrors, tried in order. overpass-api.de (the default) is
+# frequently overloaded for larger queries; the others are usually more
+# reliable for a box this size. All requests still pull the SAME underlying
+# OpenStreetMap data - these are just different servers answering it.
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api",
+    "https://overpass.kumi.systems/api",
+    "https://overpass.openstreetmap.ru/api",
+    "https://overpass.private.coffee/api",
+]
+
+TIMEOUT_SECONDS = 300  # per attempt
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "map_cache")
 CACHE_FILE = os.path.join(CACHE_DIR, "region.graphml")
 
 
+def fetch_graph_with_retries():
+    north, south, east, west = MAP_CACHE_BBOX
+    last_error = None
+
+    for i, mirror in enumerate(OVERPASS_MIRRORS, start=1):
+        print(f"[{i}/{len(OVERPASS_MIRRORS)}] trying Overpass mirror: {mirror}")
+        ox.settings.overpass_endpoint = mirror
+        ox.settings.timeout = TIMEOUT_SECONDS
+        try:
+            graph = ox.graph_from_bbox((north, south, east, west), network_type="drive")
+            print(f"  succeeded via {mirror}")
+            return graph
+        except Exception as e:
+            print(f"  failed via {mirror}: {e}")
+            last_error = e
+            if i < len(OVERPASS_MIRRORS):
+                time.sleep(5)
+
+    raise RuntimeError(f"All {len(OVERPASS_MIRRORS)} Overpass mirrors failed. Last error: {last_error}")
+
+
 def main():
     north, south, east, west = MAP_CACHE_BBOX
     print(f"Fetching OSM drive network for bbox N{north} S{south} E{east} W{west} ...")
+    print(f"Box size: ~{abs(north - south) * 111:.0f}km x ~{abs(east - west) * 111:.0f}km")
     print("This can take a few minutes depending on Overpass API load.")
 
-    graph = ox.graph_from_bbox((north, south, east, west), network_type="drive")
+    graph = fetch_graph_with_retries()
     graph = ox.add_edge_speeds(graph)
     graph = ox.add_edge_travel_times(graph)
 
@@ -59,4 +94,8 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print(f"FATAL: could not fetch/save map cache: {e}")
+        print("This is fine short-term - solve_routing.py falls back to live "
+              "per-run Overpass fetches (much smaller queries) if no cache "
+              "exists yet. Re-run this workflow later, or try again in a "
+              "few hours if Overpass is having a bad day across all mirrors.")
         sys.exit(1)
