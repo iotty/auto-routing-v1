@@ -1,0 +1,35 @@
+name: Refresh Map Cache
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Monthly refresh - roads don't change often, and this avoids hitting
+    # Overpass unnecessarily. Adjust if you want it more/less frequent.
+    - cron: "0 3 1 * *"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install osmnx networkx
+
+      - name: Fetch map
+        run: python download_map_cache.py
+
+      - name: Commit updated map cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add map_cache/region.graphml
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Refresh map cache"
+          git push
