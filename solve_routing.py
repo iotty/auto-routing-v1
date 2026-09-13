@@ -347,6 +347,35 @@ def _bbox_covers(graph, north, south, east, west):
             min(lngs) - margin <= west and max(lngs) + margin >= east)
 
 
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api",
+    "https://overpass.kumi.systems/api",
+    "https://overpass.openstreetmap.ru/api",
+    "https://overpass.private.coffee/api",
+]
+
+
+def _fetch_osm_graph_with_retries(ox, north, south, east, west, timeout_seconds=200):
+    """
+    Tries each public Overpass mirror in turn. overpass-api.de (osmnx's
+    default) is frequently overloaded/slow for anything beyond a small
+    query - this is the actual cause if you see a ConnectTimeoutError in
+    the logs. The other mirrors serve the same underlying OSM data, just
+    from a different, usually less congested, server.
+    """
+    last_error = None
+    for i, mirror in enumerate(OVERPASS_MIRRORS, start=1):
+        print(f"[OSM]   mirror {i}/{len(OVERPASS_MIRRORS)}: {mirror}")
+        ox.settings.overpass_endpoint = mirror
+        ox.settings.timeout = timeout_seconds
+        try:
+            return ox.graph_from_bbox((north, south, east, west), network_type="drive")
+        except Exception as e:
+            print(f"[OSM]   failed via {mirror}: {e}")
+            last_error = e
+    raise RuntimeError(f"All {len(OVERPASS_MIRRORS)} Overpass mirrors failed. Last error: {last_error}")
+
+
 def build_osm_matrices(locations):
     """
     Real road-network distance/time matrices, using live OpenStreetMap data
@@ -388,7 +417,7 @@ def build_osm_matrices(locations):
 
     if graph is None:
         print(f"[OSM] fetching drive network for bbox N{north:.4f} S{south:.4f} E{east:.4f} W{west:.4f} ...")
-        graph = ox.graph_from_bbox((north, south, east, west), network_type="drive")
+        graph = _fetch_osm_graph_with_retries(ox, north, south, east, west)
         graph = ox.add_edge_speeds(graph)      # estimates km/h per road segment from OSM tags
         graph = ox.add_edge_travel_times(graph)  # seconds, using the speeds above
         print(f"[OSM] graph has {len(graph.nodes)} nodes, {len(graph.edges)} edges")
