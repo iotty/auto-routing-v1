@@ -1,0 +1,32 @@
+name: Run Routing
+
+on:
+  workflow_dispatch:
+    inputs:
+      route_date:
+        description: "Route date (YYYY-MM-DD). Leave blank for tomorrow (H+1)."
+        required: false
+        default: ""
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run routing solver
+        env:
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          ROUTE_DATE: ${{ inputs.route_date }}
+        run: python solve_routing.py
