@@ -6,3 +6,6 @@ gspread-dataframe
 oauth2client
 pytz
 python-dotenv
+ortools
+osmnx
+networkx
