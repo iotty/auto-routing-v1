@@ -69,6 +69,16 @@ AVG_SPEED_KMH_FALLBACK = 25       # used ONLY if the real OSM road-network
 # an unnecessarily huge graph. ~0.05 deg is roughly 5-6 km at this latitude.
 OSM_BBOX_PADDING_DEG = 0.08
 
+# Live Overpass fetching during an actual routing run is OFF by default -
+# every environment this has been tried in has hit reliability issues, and
+# retrying it live was costing minutes per run for no benefit when it just
+# fails anyway. Set env var ALLOW_LIVE_OSM_FETCH=1 to re-enable it if you
+# want to try again (e.g. Overpass having a better day, or a private
+# instance you trust more). Without a local map_cache/region.graphml AND
+# this disabled, distance falls back to fast straight-line (haversine)
+# instead of real road distance - less accurate, but reliably fast.
+ALLOW_LIVE_OSM_FETCH = os.environ.get("ALLOW_LIVE_OSM_FETCH", "").strip() == "1"
+
 # Priority penalty: skipping a node costs this much "virtual time", scaled
 # by how many days old the order is. Must dominate normal travel costs so
 # the solver strongly prefers dropping NEWER orders over OLDER ones.
@@ -468,8 +478,19 @@ def build_osm_matrices(locations):
     this is the same underlying OSM data, scoped to what's actually needed
     for this run instead of the whole region every time.
 
-    Raises on failure (network issue, Overpass rate limit, etc.) - caller
-    falls back to haversine so a bad network day doesn't crash the whole run.
+    Raises on failure (no usable cache AND live fetch disabled/failed) -
+    caller falls back to haversine so a bad network day doesn't crash the
+    whole run.
+
+    IMPORTANT: live Overpass fetching during an actual routing run is
+    DISABLED BY DEFAULT (see ALLOW_LIVE_OSM_FETCH below). Every environment
+    this has been tried in (GitHub Actions, Google Colab) has hit Overpass
+    reliability issues - retrying it live during a time-sensitive routing
+    run was costing several minutes per run for no benefit when it just
+    fails anyway. Build map_cache/region.graphml once (via the Geofabrik +
+    pyrosm approach - see TUTORIAL.md) and this function becomes instant,
+    using zero network calls. Without a cache, this now fails fast (seconds,
+    not minutes) straight to the haversine fallback.
     """
     import osmnx as ox
     import networkx as nx
@@ -490,11 +511,18 @@ def build_osm_matrices(locations):
             graph = cached_graph
             print(f"[OSM] cached graph covers today's area: {len(graph.nodes)} nodes, {len(graph.edges)} edges")
         else:
-            print("[OSM] cached graph doesn't cover today's delivery area - "
-                  "falling back to a live fetch for this run. Consider widening "
-                  "MAP_CACHE_BBOX in download_map_cache.py and refreshing the cache.")
+            print("[OSM] cached graph doesn't cover today's delivery area. Consider widening "
+                  "MAP_CACHE_BBOX and refreshing the cache.")
 
     if graph is None:
+        if not ALLOW_LIVE_OSM_FETCH:
+            raise RuntimeError(
+                "No local map cache found, and live Overpass fetching during "
+                "routing runs is disabled by default (it has proven unreliable "
+                "and slow across every environment tried so far). Build "
+                "map_cache/region.graphml once - see TUTORIAL.md - or set "
+                "ALLOW_LIVE_OSM_FETCH=1 to re-enable the slow live-fetch path."
+            )
         print(f"[OSM] fetching drive network for bbox N{north:.4f} S{south:.4f} E{east:.4f} W{west:.4f} ...")
         graph = _fetch_osm_graph_with_retries(ox, north, south, east, west)
         graph = ox.add_edge_speeds(graph)      # estimates km/h per road segment from OSM tags
