@@ -22,9 +22,11 @@ import os
 import sys
 import json
 import math
+import time
 import datetime
 import traceback
 
+import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from ortools.constraint_solver import routing_enums_pb2
@@ -231,58 +233,83 @@ def write_routing_output(spreadsheet, route_date, scenarios):
     Writes one full plan per scenario (Routing_Plan_1Truck, _2Trucks,
     _3Trucks) plus a Routing_Scenarios comparison sheet, so you can review
     all options and pick which one to actually dispatch.
+
+    Never raises - each scenario is handled independently so one bad
+    scenario can't stop the others from being written, and the comparison
+    sheet always gets written last with whatever succeeded.
     """
     comparison_rows = []
 
-    for n, result in scenarios.items():
-        label = f"{n}Truck" if n == 1 else f"{n}Trucks"
-        plan_sheet = f"{OUTPUT_SHEET}_{label}"
-        backlog_sheet = f"{BACKLOG_SHEET}_{label}"
+    for n, result in list(scenarios.items()):
+        try:
+            label = f"{n}Truck" if n == 1 else f"{n}Trucks"
+            plan_sheet = f"{OUTPUT_SHEET}_{label}"
+            backlog_sheet = f"{BACKLOG_SHEET}_{label}"
 
-        _write_sheet(spreadsheet, plan_sheet, [
-            "Route Date", "Vehicle", "Driver", "Stop Seq", "Kode Fulfillment",
-            "Nama Penerima", "Alamat Penerima", "Latitude", "Longitude",
-            "Box (this stop)", "Cumulative Box", "ETA", "ETD",
-            "Distance from Prev (km)", "Tanggal Fulfillment Masuk FF",
-        ], [
-            [
-                route_date, r["vehicle"], r["driver"], r["seq"], r["kode_fulfillment"],
-                r["nama_penerima"], r["alamat_penerima"], r["lat"], r["lng"],
-                r["box"], r["cumulative_box"], r["eta"], r["etd"],
-                round(r["distance_from_prev_km"], 2), r["tanggal_masuk"],
-            ]
-            for r in result["routes"]
-        ])
+            if result.get("error"):
+                print(f"  [{label}] skipping plan/backlog sheets - this scenario failed to solve: {result['error']}")
+                comparison_rows.append([
+                    route_date, n, 0, 0, 0, 0, 0, 0,
+                    f"FAILED: {result['error']}",
+                ])
+                continue
 
-        _write_sheet(spreadsheet, backlog_sheet, [
-            "Route Date", "Kode Fulfillment", "Nama Penerima", "Alamat Penerima",
-            "Box", "Tanggal Fulfillment Masuk FF", "Reason",
-        ], [
-            [
-                route_date, b["kode_fulfillment"], b["nama_penerima"], b["alamat_penerima"],
-                b["box"], b["tanggal_masuk"], b.get("backlog_reason", "Backlogged"),
-            ]
-            for b in result["backlog"]
-        ])
+            _write_sheet(spreadsheet, plan_sheet, [
+                "Route Date", "Vehicle", "Driver", "Stop Seq", "Kode Fulfillment",
+                "Nama Penerima", "Alamat Penerima", "Latitude", "Longitude",
+                "Box (this stop)", "Cumulative Box", "ETA", "ETD",
+                "Distance from Prev (km)", "Tanggal Fulfillment Masuk FF",
+            ], [
+                [
+                    route_date, r["vehicle"], r["driver"], r["seq"], r["kode_fulfillment"],
+                    r["nama_penerima"], r["alamat_penerima"], r["lat"], r["lng"],
+                    r["box"], r["cumulative_box"], r["eta"], r["etd"],
+                    round(r["distance_from_prev_km"], 2), r["tanggal_masuk"],
+                ]
+                for r in result["routes"]
+            ])
 
-        total_distance = round(sum(row[4] for row in result["summary"]), 2)
-        total_stops = sum(row[2] for row in result["summary"])
-        total_box = sum(row[3] for row in result["summary"])
-        vehicles_used = sum(1 for row in result["summary"] if row[2] > 0)
+            _write_sheet(spreadsheet, backlog_sheet, [
+                "Route Date", "Kode Fulfillment", "Nama Penerima", "Alamat Penerima",
+                "Box", "Tanggal Fulfillment Masuk FF", "Reason",
+            ], [
+                [
+                    route_date, b["kode_fulfillment"], b["nama_penerima"], b["alamat_penerima"],
+                    b["box"], b["tanggal_masuk"], b.get("backlog_reason", "Backlogged"),
+                ]
+                for b in result["backlog"]
+            ])
+
+            total_distance = round(sum(row[4] for row in result["summary"]), 2)
+            total_stops = sum(row[2] for row in result["summary"])
+            total_box = sum(row[3] for row in result["summary"])
+            vehicles_used = sum(1 for row in result["summary"] if row[2] > 0)
+            comparison_rows.append([
+                route_date, n, vehicles_used, total_stops, len(result["backlog"]),
+                total_box, total_distance,
+                round(total_distance / total_stops, 2) if total_stops else 0,
+                plan_sheet,
+            ])
+
+            # Per-vehicle detail for this scenario, appended under the comparison
+            # table for context on WHY a scenario looks the way it does.
+            for row in result["summary"]:
+                vehicle, driver, stops, box, dist, duration, pct, flag = row
+                print(f"  [{label}] {vehicle} ({driver}): {stops} stops, {box} box, "
+                      f"{dist} km, {duration} min, {pct}% capacity"
+                      + (f" -- {flag}" if flag else ""))
+
+        except Exception as e:
+            print(f"  [{n}-vehicle scenario] unexpected error while writing its output, "
+                  f"skipping it and continuing with the rest: {e}")
+            print(traceback.format_exc())
+            comparison_rows.append([route_date, n, 0, 0, 0, 0, 0, 0, f"FAILED (write error): {e}"])
+
+    if not comparison_rows:
         comparison_rows.append([
-            route_date, n, vehicles_used, total_stops, len(result["backlog"]),
-            total_box, total_distance,
-            round(total_distance / total_stops, 2) if total_stops else 0,
-            plan_sheet,
+            route_date, 0, 0, 0, 0, 0, 0, 0,
+            "No scenarios produced a result this run - check the workflow log for details.",
         ])
-
-        # Per-vehicle detail for this scenario, appended under the comparison
-        # table for context on WHY a scenario looks the way it does.
-        for row in result["summary"]:
-            vehicle, driver, stops, box, dist, duration, pct, flag = row
-            print(f"  [{label}] {vehicle} ({driver}): {stops} stops, {box} box, "
-                  f"{dist} km, {duration} min, {pct}% capacity"
-                  + (f" -- {flag}" if flag else ""))
 
     _write_sheet(spreadsheet, SCENARIOS_SHEET, [
         "Route Date", "Vehicles Available", "Vehicles Actually Used", "Stops Served",
@@ -291,28 +318,65 @@ def write_routing_output(spreadsheet, route_date, scenarios):
     ], comparison_rows)
 
 
-def _write_sheet(spreadsheet, sheet_name, header, rows):
+def _write_sheet(spreadsheet, sheet_name, header, rows, max_retries=4, base_delay=3):
+    """
+    Never raises - a write failure here (even after retries) is logged and
+    swallowed rather than crashing the whole run, since by this point the
+    expensive solving work is already done and other sheets may still need
+    writing. Returns True/False for the caller to track what succeeded.
+    """
     try:
-        worksheet = spreadsheet.worksheet(sheet_name)
-        worksheet.clear()
-    except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="200", cols=str(max(len(header), 1)))
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="200", cols=str(max(len(header), 1)))
 
-    all_rows = [header] + rows
-    if all_rows:
-        worksheet.update(f"A1", all_rows)
-    print(f"[{sheet_name}] wrote {len(rows)} row(s).")
+        all_rows = [header] + rows
+
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                worksheet.clear()
+                if all_rows:
+                    worksheet.update("A1", all_rows)
+                print(f"[{sheet_name}] wrote {len(rows)} row(s).")
+                return True
+            except gspread.exceptions.APIError as e:
+                last_error = e
+                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                if status_code in (429, 500, 502, 503):
+                    delay = base_delay * (2 ** (attempt - 1))
+                    print(f"[{sheet_name}] transient error (HTTP {status_code}), "
+                          f"retry {attempt}/{max_retries} in {delay}s ...")
+                    time.sleep(delay)
+                    continue
+                raise
+
+        print(f"[{sheet_name}] FAILED to write after {max_retries} attempts: {last_error}")
+        return False
+
+    except Exception:
+        print(f"[{sheet_name}] unexpected error while writing - skipping this sheet, continuing with the rest:")
+        print(traceback.format_exc())
+        return False
 
 
 # ==========================================
 # ROUTING (VRP) CORE
 # ==========================================
 def haversine_km(lat1, lng1, lat2, lng2):
+    """
+    This is the LAST-RESORT fallback for distance/time - it must never
+    raise, under any input. Floating-point rounding can occasionally push
+    sqrt(a) a hair above 1.0 (e.g. 1.0000000000000002), which would crash
+    math.asin with a domain error - clamping prevents that.
+    """
     R = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lng2 - lng1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    a = max(0.0, min(1.0, a))
     return 2 * R * math.asin(math.sqrt(a))
 
 
@@ -355,17 +419,30 @@ OVERPASS_MIRRORS = [
 ]
 
 
-def _fetch_osm_graph_with_retries(ox, north, south, east, west, timeout_seconds=200):
+def _fetch_osm_graph_with_retries(ox, north, south, east, west, timeout_seconds=90, overall_budget_seconds=360):
     """
     Tries each public Overpass mirror in turn. overpass-api.de (osmnx's
     default) is frequently overloaded/slow for anything beyond a small
     query - this is the actual cause if you see a ConnectTimeoutError in
     the logs. The other mirrors serve the same underlying OSM data, just
     from a different, usually less congested, server.
+
+    Both per-mirror timeout AND the overall budget across all mirrors are
+    kept short deliberately: if every mirror hangs instead of failing fast,
+    we want OUR code to raise a clear error well before the GitHub Actions
+    job's own timeout silently kills the whole run with no diagnostic
+    message at all (this happened in practice with a longer budget).
     """
     last_error = None
+    start_time = time.time()
     for i, mirror in enumerate(OVERPASS_MIRRORS, start=1):
-        print(f"[OSM]   mirror {i}/{len(OVERPASS_MIRRORS)}: {mirror}")
+        elapsed = time.time() - start_time
+        if elapsed > overall_budget_seconds:
+            raise RuntimeError(
+                f"Giving up after {elapsed:.0f}s across {i - 1} mirror(s) - hit the "
+                f"{overall_budget_seconds}s budget for this fetch. Last error: {last_error}"
+            )
+        print(f"[OSM]   mirror {i}/{len(OVERPASS_MIRRORS)}: {mirror} (elapsed: {elapsed:.0f}s)")
         ox.settings.overpass_endpoint = mirror
         ox.settings.timeout = timeout_seconds
         try:
@@ -373,6 +450,8 @@ def _fetch_osm_graph_with_retries(ox, north, south, east, west, timeout_seconds=
         except Exception as e:
             print(f"[OSM]   failed via {mirror}: {e}")
             last_error = e
+            if i < len(OVERPASS_MIRRORS):
+                time.sleep(3)
     raise RuntimeError(f"All {len(OVERPASS_MIRRORS)} Overpass mirrors failed. Last error: {last_error}")
 
 
@@ -451,11 +530,88 @@ def build_osm_matrices(locations):
     return dist_km, time_min
 
 
+OSRM_DEMO_URL = "https://router.project-osrm.org/table/v1/driving/"
+OSRM_DEMO_MAX_POINTS = 100  # OSRM demo server caps table queries around 10,000
+                             # entries (distances or durations); 100x100=10,000
+                             # is the practical ceiling, well above your
+                             # current real volume (~36 orders/day).
+
+
+def build_osrm_demo_matrices(locations):
+    """
+    Real road-network distances via OSRM's free public demo server - a
+    single HTTP call returns the full distance+duration matrix for however
+    many points you send, no graph-building or downloads needed at all.
+
+    This is the fastest option BY FAR for your actual use case (a matrix
+    for ~30-100 points per routing run), but it's explicitly a "best
+    effort, no uptime guarantee" service per OSRM's own usage policy -
+    fine for getting real results now; a business-critical daily job
+    should eventually move to a self-hosted OSRM instance for guaranteed
+    reliability. I could not test this live call myself (same network
+    restriction as the Overpass path) - treat your first real run as the
+    actual verification of this specific function.
+
+    Raises on failure or if there are too many points - caller falls back
+    to the Overpass-based path.
+    """
+    if len(locations) > OSRM_DEMO_MAX_POINTS:
+        raise RuntimeError(f"{len(locations)} points exceeds the "
+                            f"{OSRM_DEMO_MAX_POINTS}-point practical limit for "
+                            f"the OSRM demo server's table endpoint.")
+
+    coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
+    url = OSRM_DEMO_URL + coords
+    params = {"annotations": "distance,duration"}
+
+    print(f"[OSRM-demo] requesting {len(locations)}x{len(locations)} table ...")
+    response = requests.get(url, params=params, timeout=30,
+                             headers={"User-Agent": "auto-routing-vrp/1.0"})
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("code") != "Ok":
+        raise RuntimeError(f"OSRM demo server returned: {data.get('code')} - {data.get('message', '')}")
+
+    distances_m = data["distances"]  # meters
+    durations_s = data["durations"]  # seconds
+
+    n = len(locations)
+    dist_km = [[0.0] * n for _ in range(n)]
+    time_min = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            d = distances_m[i][j]
+            t = durations_s[i][j]
+            if d is None or t is None:
+                # OSRM found no route between this pair (rare - e.g. an
+                # isolated road segment) - fall back to haversine for just
+                # this one pair rather than failing the whole matrix.
+                km = haversine_km(locations[i]["lat"], locations[i]["lng"],
+                                   locations[j]["lat"], locations[j]["lng"])
+                dist_km[i][j] = km
+                time_min[i][j] = (km / AVG_SPEED_KMH_FALLBACK) * 60.0
+            else:
+                dist_km[i][j] = d / 1000.0
+                time_min[i][j] = t / 60.0
+
+    print(f"[OSRM-demo] succeeded")
+    return dist_km, time_min
+
+
 def build_distance_time_matrices(locations):
     if os.environ.get("SKIP_OSM"):
         # Fast path for local testing without network access - see
         # test_routing.py and README.
         return build_haversine_matrices(locations)
+
+    try:
+        return build_osrm_demo_matrices(locations)
+    except Exception as e:
+        print(f"[OSRM-demo] failed ({e}); falling back to Overpass-based road network ...")
+
     try:
         return build_osm_matrices(locations)
     except Exception as e:
@@ -679,7 +835,13 @@ def solve_all_scenarios(orders, route_date):
     scenarios = {}
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) available ---")
-        routes, backlog, summary = solve_routing(orders, route_date, n, dist_km, time_min)
+        try:
+            routes, backlog, summary = solve_routing(orders, route_date, n, dist_km, time_min)
+        except Exception as e:
+            print(f"  FAILED to solve {n}-vehicle scenario, skipping it (others still proceed): {e}")
+            print(traceback.format_exc())
+            scenarios[n] = {"routes": [], "backlog": [], "summary": [], "error": str(e)}
+            continue
         total_distance = sum(row[4] for row in summary)
         total_stops = sum(row[2] for row in summary)
         print(f"  Served {total_stops}/{len(orders)}, backlog {len(backlog)}, "
