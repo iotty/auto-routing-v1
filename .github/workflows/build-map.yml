@@ -21,7 +21,6 @@ jobs:
         run: curl -L -o raw-java.osm.pbf https://download.geofabrik.de/asia/indonesia/java-latest.osm.pbf
 
       - name: Crop Map to Banten, Jakarta, and West Java
-        # This shrinks the file so GitHub Actions won't run out of memory!
         run: osmium extract -b 105.0,-8.0,109.0,-5.5 raw-java.osm.pbf -o java-latest.osm.pbf
 
       - name: Extract Map
@@ -34,7 +33,10 @@ jobs:
         run: docker run -v ${{ github.workspace }}:/data ghcr.io/project-osrm/osrm-backend osrm-customize /data/java-latest.osrm
 
       - name: Zip the Processed Data
-        run: zip java-osrm-data.zip java-latest.osrm java-latest.osrm.*
+        run: |
+          # Fix permissions so zip can read the Docker-generated files
+          sudo chmod -R 777 java-latest.osrm*
+          zip java-osrm-data.zip java-latest.osrm*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
