@@ -20,10 +20,10 @@ from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
 # ==========================================
-# CONFIG
+# CONFIG (Now dynamic via Apps Script / GitHub Actions)
 # ==========================================
-DEPOT_LAT = -6.238931133669451
-DEPOT_LNG = 106.53540668179242
+DEPOT_LAT = float(os.environ.get("DEPOT_LAT", -6.238931133669451))
+DEPOT_LNG = float(os.environ.get("DEPOT_LNG", 106.53540668179242))
 DEPOT_NAME = "FF Bitung"
 
 VEHICLES = [
@@ -33,12 +33,12 @@ VEHICLES = [
 ]
 NUM_VEHICLES = len(VEHICLES)
 
-VEHICLE_CAPACITY_BOX = 1200
-UTILIZATION_FLAG_THRESHOLD = 22
+VEHICLE_CAPACITY_BOX = int(os.environ.get("VEHICLE_CAPACITY_BOX", 1200))
+SHIFT_LENGTH_MINUTES = int(os.environ.get("SHIFT_LENGTH_MINUTES", 600))
+SERVICE_TIME_MINUTES = int(os.environ.get("SERVICE_TIME_MINUTES", 15))
 
+UTILIZATION_FLAG_THRESHOLD = 22
 SHIFT_START_HOUR = 6
-SHIFT_LENGTH_MINUTES = 10 * 60
-SERVICE_TIME_MINUTES = 15
 AVG_SPEED_KMH_FALLBACK = 25
 
 # Massively increased penalties so the solver never drops orders just to save distance
