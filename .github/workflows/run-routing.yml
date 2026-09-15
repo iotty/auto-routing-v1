@@ -4,29 +4,49 @@ on:
   workflow_dispatch:
     inputs:
       route_date:
-        description: "Route date (YYYY-MM-DD). Leave blank for tomorrow (H+1)."
+        description: 'Route Date (YYYY-MM-DD)'
         required: false
-        default: ""
 
 jobs:
-  route:
+  run-routing:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.10'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run routing solver
+      - name: Download and Unzip Map Data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p map_data
+          # Downloads the zip from the release you created securely
+          gh release download v1.0-maps -p "java-osrm-data.zip"
+          unzip java-osrm-data.zip -d map_data/
+
+      - name: Start Local OSRM Server
+        run: |
+          docker run -d --name osrm -p 5000:5000 \
+            -v ${{ github.workspace }}/map_data:/data \
+            ghcr.io/project-osrm/osrm-backend \
+            osrm-routed --algorithm mld /data/java-latest.osrm
+          
+          echo "Waiting for OSRM server to boot up..."
+          until curl -s "http://localhost:5000/table/v1/driving/106.53,-6.23;106.60,-6.20" > /dev/null; do
+            sleep 2
+          done
+          echo "OSRM Server is ready!"
+
+      - name: Run Routing Solver
         env:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          ROUTE_DATE: ${{ inputs.route_date }}
+          ROUTE_DATE: ${{ github.event.inputs.route_date }}
         run: python solve_routing.py
