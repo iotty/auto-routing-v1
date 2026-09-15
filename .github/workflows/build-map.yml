@@ -1,0 +1,35 @@
+name: Build OSRM Map Data
+on:
+  workflow_dispatch: # Allows you to click a button to run this
+
+permissions:
+  contents: write # Allows the action to create a Release
+
+jobs:
+  build-map:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Download Java OSM Data
+        run: curl -L -o java-latest.osm.pbf https://download.geofabrik.de/asia/indonesia/java-latest.osm.pbf
+
+      - name: Extract Map
+        run: docker run -v ${{ github.workspace }}:/data ghcr.io/project-osrm/osrm-backend osrm-extract -p /opt/car.lua /data/java-latest.osm.pbf
+
+      - name: Partition Map
+        run: docker run -v ${{ github.workspace }}:/data ghcr.io/project-osrm/osrm-backend osrm-partition /data/java-latest.osrm
+
+      - name: Customize Map
+        run: docker run -v ${{ github.workspace }}:/data ghcr.io/project-osrm/osrm-backend osrm-customize /data/java-latest.osrm
+
+      - name: Zip the Processed Data
+        run: zip java-osrm-data.zip java-latest.osrm java-latest.osrm.*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v1.0-maps
+          name: "OSRM Map Data (Java)"
+          files: java-osrm-data.zip
