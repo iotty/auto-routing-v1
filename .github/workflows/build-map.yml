@@ -1,9 +1,9 @@
 name: Build OSRM Map Data
 on:
-  workflow_dispatch: # Allows you to click a button to run this
+  workflow_dispatch:
 
 permissions:
-  contents: write # Allows the action to create a Release
+  contents: write
 
 jobs:
   build-map:
@@ -12,8 +12,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Download Java OSM Data
-        run: curl -L -o java-latest.osm.pbf https://download.geofabrik.de/asia/indonesia/java-latest.osm.pbf
+      - name: Install Osmium Tool
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y osmium-tool zip
+
+      - name: Download Raw Java OSM Data
+        run: curl -L -o raw-java.osm.pbf https://download.geofabrik.de/asia/indonesia/java-latest.osm.pbf
+
+      - name: Crop Map to Banten, Jakarta, and West Java
+        # This shrinks the file so GitHub Actions won't run out of memory!
+        run: osmium extract -b 105.0,-8.0,109.0,-5.5 raw-java.osm.pbf -o java-latest.osm.pbf
 
       - name: Extract Map
         run: docker run -v ${{ github.workspace }}:/data ghcr.io/project-osrm/osrm-backend osrm-extract -p /opt/car.lua /data/java-latest.osm.pbf
