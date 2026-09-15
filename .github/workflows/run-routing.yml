@@ -6,6 +6,21 @@ on:
       route_date:
         description: 'Route Date (YYYY-MM-DD)'
         required: false
+      vehicle_capacity:
+        description: 'Max Box Capacity'
+        required: false
+      shift_length:
+        description: 'Shift Length (Minutes)'
+        required: false
+      service_time:
+        description: 'Service Time (Minutes)'
+        required: false
+      depot_lat:
+        description: 'Depot Latitude'
+        required: false
+      depot_lng:
+        description: 'Depot Longitude'
+        required: false
 
 jobs:
   run-routing:
@@ -49,7 +64,6 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           ROUTE_DATE: ${{ github.event.inputs.route_date }}
-          # Add these to pass the UI settings to python
           VEHICLE_CAPACITY_BOX: ${{ github.event.inputs.vehicle_capacity }}
           SHIFT_LENGTH_MINUTES: ${{ github.event.inputs.shift_length }}
           SERVICE_TIME_MINUTES: ${{ github.event.inputs.service_time }}
