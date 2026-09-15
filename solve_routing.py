@@ -49,12 +49,14 @@ SOLVE_TIME_LIMIT_SECONDS = 15
 
 # Pointing to the local OSRM server running in GitHub Actions
 OSRM_URL = os.environ.get("OSRM_URL", "http://localhost:5000/table/v1/driving/")
+OSRM_ROUTE_URL = os.environ.get("OSRM_ROUTE_URL", "http://localhost:5000/route/v1/driving/")
 OSRM_MAX_POINTS = 5000
 
 SOURCE_SHEET = "Order_Outstanding_Cleaned"
 OUTPUT_SHEET = "Routing_Plan"
 BACKLOG_SHEET = "Routing_Backlog"
 SCENARIOS_SHEET = "Routing_Scenarios"
+GEOMETRY_SHEET = "Routing_Geometry"
 
 # ==========================================
 # GOOGLE SHEETS I/O
@@ -121,17 +123,27 @@ def parse_date_flexible(value):
 
 
 def write_routing_output(spreadsheet, route_date, scenarios):
+    """
+    Writes one full plan per scenario, PRESERVING history across dates:
+    re-running for the same route_date replaces just that date's rows;
+    running for a different date adds alongside existing history rather
+    than overwriting it. This is what lets the dashboard correctly show
+    "no plan yet" for a date that's never been run, instead of always
+    showing whatever the last run happened to produce.
+    """
     comparison_rows = []
+
     for n, result in list(scenarios.items()):
         label = f"{n}Truck" if n == 1 else f"{n}Trucks"
         plan_sheet = f"{OUTPUT_SHEET}_{label}"
         backlog_sheet = f"{BACKLOG_SHEET}_{label}"
+        geometry_sheet = f"{GEOMETRY_SHEET}_{label}"
 
         if result.get("error"):
             comparison_rows.append([route_date, n, 0, 0, 0, 0, 0, 0, f"FAILED: {result['error']}"])
             continue
 
-        _write_sheet(spreadsheet, plan_sheet, [
+        _upsert_sheet_by_date(spreadsheet, plan_sheet, [
             "Route Date", "Vehicle", "Driver", "Stop Seq", "Kode Fulfillment",
             "Nama Penerima", "Alamat Penerima", "Latitude", "Longitude",
             "Box (this stop)", "Cumulative Box", "ETA", "ETD",
@@ -142,33 +154,126 @@ def write_routing_output(spreadsheet, route_date, scenarios):
              r["box"], r["cumulative_box"], r["eta"], r["etd"],
              round(r["distance_from_prev_km"], 2), r["tanggal_masuk"]]
             for r in result["routes"]
-        ])
+        ], route_date)
 
-        _write_sheet(spreadsheet, backlog_sheet, [
+        _upsert_sheet_by_date(spreadsheet, backlog_sheet, [
             "Route Date", "Kode Fulfillment", "Nama Penerima", "Alamat Penerima",
             "Box", "Tanggal Fulfillment Masuk FF", "Reason",
         ], [
             [route_date, b["kode_fulfillment"], b["nama_penerima"], b["alamat_penerima"],
              b["box"], b["tanggal_masuk"], b.get("backlog_reason", "Backlogged")]
             for b in result["backlog"]
-        ])
+        ], route_date)
+
+        # Real road-following geometry, fetched ONCE here while the local
+        # OSRM server (started earlier in the GitHub Actions job) is still
+        # up - the dashboard reads this back later instead of needing any
+        # live map API call of its own, which is what made the browser-side
+        # map draw straight lines instead of real roads before.
+        geometry_rows = build_geometry_rows(route_date, result["routes"])
+        _upsert_sheet_by_date(spreadsheet, geometry_sheet, [
+            "Route Date", "Vehicle", "Geometry (JSON [[lat,lng],...])",
+        ], geometry_rows, route_date)
 
         total_distance = round(sum(row[4] for row in result["summary"]), 2)
         total_stops = sum(row[2] for row in result["summary"])
         total_box = sum(row[3] for row in result["summary"])
         vehicles_used = sum(1 for row in result["summary"] if row[2] > 0)
-        
+
         comparison_rows.append([
             route_date, n, vehicles_used, total_stops, len(result["backlog"]),
             total_box, total_distance,
             round(total_distance / total_stops, 2) if total_stops else 0, plan_sheet,
         ])
 
-    _write_sheet(spreadsheet, SCENARIOS_SHEET, [
+    _upsert_sheet_by_date(spreadsheet, SCENARIOS_SHEET, [
         "Route Date", "Vehicles Available", "Vehicles Actually Used", "Stops Served",
         "Stops Backlogged", "Total Box", "Total Distance (km)",
         "Distance per Stop (km)", "See Plan Tab",
-    ], comparison_rows)
+    ], comparison_rows, route_date)
+
+
+def _read_sheet_rows(spreadsheet, sheet_name):
+    """Returns (header, rows) as plain lists, or (None, []) if the sheet
+    doesn't exist yet or has no data."""
+    try:
+        worksheet = spreadsheet.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        return None, []
+    values = worksheet.get_all_values()
+    if not values:
+        return None, []
+    return values[0], values[1:]
+
+
+def _upsert_sheet_by_date(spreadsheet, sheet_name, header, new_rows, route_date, max_retries=4):
+    """
+    Like _write_sheet, but preserves history across dates instead of blindly
+    overwriting: existing rows whose "Route Date" (first column) does NOT
+    match route_date are kept as-is; rows matching route_date are replaced
+    with new_rows. Re-running for the same date is idempotent (no
+    duplicates); running for a new date adds alongside prior history.
+    """
+    existing_header, existing_rows = _read_sheet_rows(spreadsheet, sheet_name)
+
+    if existing_header and existing_header != header:
+        print(f"[{sheet_name}] WARNING: existing header doesn't match the current schema - "
+              f"rebuilding this sheet from scratch (its prior history will be lost this one time).")
+        existing_rows = []
+
+    kept_rows = [row for row in existing_rows if len(row) == 0 or row[0] != route_date]
+    combined_rows = kept_rows + new_rows
+
+    return _write_sheet(spreadsheet, sheet_name, header, combined_rows, max_retries=max_retries)
+
+
+def fetch_route_geometry(depot_lat, depot_lng, stops):
+    """
+    stops: solver-ordered list of stop dicts with 'lat'/'lng'. Returns a
+    list of [lat, lng] pairs tracing the real road route (depot -> stops ->
+    depot) via the local OSRM server, or None if that call fails for any
+    reason - callers should fall back to straight lines for that one
+    vehicle rather than fail the whole run over a single geometry lookup.
+    """
+    if not stops:
+        return None
+    coords = [(depot_lng, depot_lat)] + [(s["lng"], s["lat"]) for s in stops] + [(depot_lng, depot_lat)]
+    coord_str = ";".join(f"{lng},{lat}" for lng, lat in coords)
+    url = OSRM_ROUTE_URL + coord_str
+    try:
+        response = requests.get(url, params={"overview": "full", "geometries": "geojson"}, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("code") != "Ok" or not data.get("routes"):
+            return None
+        # GeoJSON coordinates are [lng, lat] - flip to [lat, lng] to match
+        # how coordinates are handled everywhere else in this system.
+        coords_geojson = data["routes"][0]["geometry"]["coordinates"]
+        return [[c[1], c[0]] for c in coords_geojson]
+    except Exception as e:
+        print(f"  [geometry] OSRM route call failed: {e}")
+        return None
+
+
+def build_geometry_rows(route_date, routes):
+    """routes: flat list of stop dicts (solve_routing's return), grouped
+    here by vehicle. One row per vehicle that has stops AND whose OSRM
+    route call succeeded; vehicles with no stops or a failed geometry
+    lookup are simply omitted - the dashboard falls back to a straight
+    line for those specific vehicles."""
+    by_vehicle = {}
+    for r in routes:
+        by_vehicle.setdefault(r["vehicle"], []).append(r)
+
+    geometry_rows = []
+    for vehicle, stops in by_vehicle.items():
+        stops_sorted = sorted(stops, key=lambda r: r["seq"])
+        geometry = fetch_route_geometry(DEPOT_LAT, DEPOT_LNG, stops_sorted)
+        if geometry:
+            geometry_rows.append([route_date, vehicle, json.dumps(geometry)])
+        else:
+            print(f"  [geometry] no geometry captured for {vehicle} - dashboard will use a straight line for it")
+    return geometry_rows
 
 
 def _write_sheet(spreadsheet, sheet_name, header, rows, max_retries=4):
