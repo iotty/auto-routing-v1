@@ -49,4 +49,10 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           ROUTE_DATE: ${{ github.event.inputs.route_date }}
+          # Add these to pass the UI settings to python
+          VEHICLE_CAPACITY_BOX: ${{ github.event.inputs.vehicle_capacity }}
+          SHIFT_LENGTH_MINUTES: ${{ github.event.inputs.shift_length }}
+          SERVICE_TIME_MINUTES: ${{ github.event.inputs.service_time }}
+          DEPOT_LAT: ${{ github.event.inputs.depot_lat }}
+          DEPOT_LNG: ${{ github.event.inputs.depot_lng }}
         run: python solve_routing.py
