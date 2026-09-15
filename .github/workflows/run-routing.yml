@@ -27,7 +27,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p map_data
-          # Downloads the zip from the release you created securely
+          # Downloads the zip securely from the GitHub release you just created
           gh release download v1.0-maps -p "java-osrm-data.zip"
           unzip java-osrm-data.zip -d map_data/
 
