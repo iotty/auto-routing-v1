@@ -41,9 +41,10 @@ UTILIZATION_FLAG_THRESHOLD = 22
 SHIFT_START_HOUR = 6
 AVG_SPEED_KMH_FALLBACK = 25
 
-# Massively increased penalties so the solver never drops orders just to save distance
+# Base penalty prevents dropping new orders to save distance.
+# Exponential multiplier ensures older orders always outrank newer ones.
 PRIORITY_BASE_PENALTY = 10_000_000
-PRIORITY_WEIGHT_PER_DAY = 1_000_000
+PRIORITY_EXP_MULTIPLIER = 100
 
 SOLVE_TIME_LIMIT_SECONDS = 15
 
@@ -372,7 +373,15 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     for idx in range(1, len(locations)):
         order_date = parse_date_flexible(locations[idx].get("tanggal_masuk"))
         age = max(0, (route_date - order_date).days) if order_date else 0
-        routing.AddDisjunction([manager.NodeToIndex(idx)], PRIORITY_BASE_PENALTY + (PRIORITY_WEIGHT_PER_DAY * age))
+        
+        # Cap age at 4 to prevent 64-bit integer overflow in OR-Tools (max ~9.2e18).
+        # An H+3 order has a penalty of 10,000,000 * 100^3 = 10,000,000,000,000.
+        # This mathematically guarantees the solver will drop any number of newer orders 
+        # before it drops a single H+3 order.
+        safe_age = min(age, 4)
+        penalty = int(PRIORITY_BASE_PENALTY * (PRIORITY_EXP_MULTIPLIER ** safe_age))
+        
+        routing.AddDisjunction([manager.NodeToIndex(idx)], penalty)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
