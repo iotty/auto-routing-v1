@@ -30,3 +30,24 @@ jobs:
           TMS_PASSWORD: ${{ secrets.TMS_PASSWORD }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: python pipeline.py
+
+  keepalive:
+    # Scheduled workflows get auto-disabled by GitHub after 60 days with no
+    # commit to the repo (this pipeline only writes to Google Sheets, never
+    # to git, so that clock would otherwise just keep ticking silently).
+    # Re-enabling via the API on every scheduled run - twice a day - resets
+    # that clock without needing a dummy commit or a third-party action.
+    # Runs even if the sync job above fails, so a broken pipeline doesn't
+    # also cost you the schedule itself.
+    needs: sync
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow (resets the 60-day inactivity clock)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PUT \
+            "repos/${{ github.repository }}/actions/workflows/sync-data.yml/enable"
