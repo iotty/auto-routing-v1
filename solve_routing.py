@@ -27,9 +27,9 @@ DEPOT_LNG = float(os.environ.get("DEPOT_LNG", 106.53540668179242))
 DEPOT_NAME = "FF Bitung"
 
 VEHICLES = [
-    {"name": "CDE Long 1", "driver": "Ade"},
-    {"name": "CDE Long 2", "driver": "Ahmad"},
-    {"name": "CDE Long 3", "driver": "Subki"},
+    {"name": "CDE Long 1", "driver": "Ade", "nopol": "B 9391 BXW"},
+    {"name": "CDE Long 2", "driver": "Ahmad", "nopol": "B 9389 BXW"},
+    {"name": "CDE Long 3", "driver": "Subki", "nopol": "B 9390 BXW"},
 ]
 NUM_VEHICLES = len(VEHICLES)
 
@@ -112,6 +112,16 @@ def get_spreadsheet():
     return gc.open_by_key(spreadsheet_id)
 
 
+def _safe_col(row, idx, col_name, default=""):
+    """Defensive column access: returns `default` if the column doesn't
+    exist in this sheet or the row is short, instead of raising - so an
+    optional field being absent never crashes the whole order load."""
+    i = idx.get(col_name)
+    if i is None or i >= len(row):
+        return default
+    return row[i]
+
+
 def load_orders(spreadsheet):
     sheet = spreadsheet.worksheet(SOURCE_SHEET)
     values = sheet.get_all_values()
@@ -134,6 +144,13 @@ def load_orders(spreadsheet):
                 "alamat_penerima": row[idx["Alamat Penerima"]],
                 "lat": lat, "lng": lng, "box": box,
                 "tanggal_masuk": row[idx["Tanggal Fulfillment Masuk FF"]],
+                # Added for the ops-team XLSX export template - each
+                # defaults to "" if the column isn't present, rather than
+                # crashing order load over an optional field.
+                "nomor_awb": _safe_col(row, idx, "Nomor AWB"),
+                "kabupaten_kota": _safe_col(row, idx, "Kabupaten/Kota Penerima"),
+                "jam_masuk": _safe_col(row, idx, "Jam Fulfillment Masuk FF"),
+                "jumlah_bku": _safe_col(row, idx, "Jumlah BKU", box),
             })
         except (ValueError, IndexError):
             continue
@@ -171,15 +188,17 @@ def write_routing_output(spreadsheet, route_date, scenarios):
             continue
 
         _upsert_sheet_by_date(spreadsheet, plan_sheet, [
-            "Route Date", "Vehicle", "Driver", "Stop Seq", "Kode Fulfillment",
-            "Nama Penerima", "Alamat Penerima", "Latitude", "Longitude",
+            "Route Date", "Vehicle", "Driver", "Nopol", "Stop Seq", "Kode Fulfillment",
+            "Nama Penerima", "Alamat Penerima", "Kabupaten/Kota Penerima", "Latitude", "Longitude",
             "Box (this stop)", "Cumulative Box", "ETA", "ETD",
             "Distance from Prev (km)", "Tanggal Fulfillment Masuk FF",
+            "Nomor AWB", "Jam Fulfillment Masuk FF", "Jumlah BKU",
         ], [
-            [route_date, r["vehicle"], r["driver"], r["seq"], r["kode_fulfillment"],
-             r["nama_penerima"], r["alamat_penerima"], r["lat"], r["lng"],
+            [route_date, r["vehicle"], r["driver"], r["nopol"], r["seq"], r["kode_fulfillment"],
+             r["nama_penerima"], r["alamat_penerima"], r["kabupaten_kota"], r["lat"], r["lng"],
              r["box"], r["cumulative_box"], r["eta"], r["etd"],
-             round(r["distance_from_prev_km"], 2), r["tanggal_masuk"]]
+             round(r["distance_from_prev_km"], 2), r["tanggal_masuk"],
+             r["nomor_awb"], r["jam_masuk"], r["jumlah_bku"]]
             for r in result["routes"]
         ], route_date)
 
@@ -459,7 +478,8 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
                 arr_min = solution.Value(time_dim.CumulVar(idx))
                 stop_service_min = service_time_minutes(locations[node].get("box", 0))
                 v_route.append({
-                    "vehicle": VEHICLES[v_id]["name"], "driver": VEHICLES[v_id]["driver"], "seq": seq,
+                    "vehicle": VEHICLES[v_id]["name"], "driver": VEHICLES[v_id]["driver"],
+                    "nopol": VEHICLES[v_id].get("nopol", ""), "seq": seq,
                     "kode_fulfillment": locations[node]["kode_fulfillment"],
                     "nama_penerima": locations[node]["nama_penerima"],
                     "alamat_penerima": locations[node]["alamat_penerima"],
@@ -468,6 +488,10 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
                     "eta": f"{(SHIFT_START_HOUR * 60 + arr_min) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + arr_min) % 60:02.0f}",
                     "etd": f"{(SHIFT_START_HOUR * 60 + arr_min + stop_service_min) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + arr_min + stop_service_min) % 60:02.0f}",
                     "distance_from_prev_km": dist_km[prev][node], "tanggal_masuk": locations[node]["tanggal_masuk"],
+                    "nomor_awb": locations[node].get("nomor_awb", ""),
+                    "kabupaten_kota": locations[node].get("kabupaten_kota", ""),
+                    "jam_masuk": locations[node].get("jam_masuk", ""),
+                    "jumlah_bku": locations[node].get("jumlah_bku", locations[node].get("box", 0)),
                 })
                 prev = node
             idx = solution.Value(routing.NextVar(idx))
