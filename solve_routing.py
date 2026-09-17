@@ -35,15 +35,14 @@ NUM_VEHICLES = len(VEHICLES)
 
 VEHICLE_CAPACITY_BOX = int(os.environ.get("VEHICLE_CAPACITY_BOX", 1200))
 SHIFT_LENGTH_MINUTES = int(os.environ.get("SHIFT_LENGTH_MINUTES", 600))
-# Service time per stop is now variable, not flat: base time (unloading
-# setup, paperwork) plus a per-box component (actual unload time scales
-# with how much is being dropped off) - mirrors how real dispatch/OptimoRoute-
-# style software models this, rather than treating a 2-box and 40-box stop
-# as taking the same time. SERVICE_TIME_MINUTES keeps its existing name/env
-# var (now meaning the BASE component) so the dashboard's existing Settings
-# field still works without any changes there; the per-box rate is new.
+# Service time per stop is piecewise: a flat base for small orders (setup/
+# paperwork time dominates when there's not much to unload), then scaling
+# up per box once an order is big enough that unload time actually starts
+# to matter. Mirrors real dispatch software's variable-duration modeling
+# better than either a pure flat time or a pure linear-from-zero formula.
 SERVICE_TIME_BASE_MINUTES = int(os.environ.get("SERVICE_TIME_MINUTES", 15))
-SERVICE_TIME_PER_BOX_MINUTES = float(os.environ.get("SERVICE_TIME_PER_BOX_MINUTES", 1))
+SERVICE_TIME_FREE_BOX_THRESHOLD = int(os.environ.get("SERVICE_TIME_FREE_BOX_THRESHOLD", 6))
+SERVICE_TIME_PER_EXTRA_BOX_MINUTES = float(os.environ.get("SERVICE_TIME_PER_EXTRA_BOX_MINUTES", 1))
 
 
 def service_time_minutes(box_count):
@@ -51,8 +50,18 @@ def service_time_minutes(box_count):
     to a whole minute the SAME way everywhere it's used (the solver's own
     time-budget accounting AND the displayed ETD), so the shift-length
     constraint the solver actually enforces and what a dispatcher sees on
-    screen never silently drift apart."""
-    return int(round(SERVICE_TIME_BASE_MINUTES + SERVICE_TIME_PER_BOX_MINUTES * box_count))
+    screen never silently drift apart.
+
+    < SERVICE_TIME_FREE_BOX_THRESHOLD boxes: flat SERVICE_TIME_BASE_MINUTES.
+    >= threshold: base + (box_count - (threshold - 1)) extra minutes, i.e.
+    the boxes AT and ABOVE the threshold are what add time, not the whole
+    count from zero. Example with defaults (base=15, threshold=6, rate=1):
+    5 boxes -> 15 min, 6 boxes -> 16 min, 10 boxes -> 20 min.
+    """
+    if box_count < SERVICE_TIME_FREE_BOX_THRESHOLD:
+        return SERVICE_TIME_BASE_MINUTES
+    extra_boxes = box_count - (SERVICE_TIME_FREE_BOX_THRESHOLD - 1)
+    return int(round(SERVICE_TIME_BASE_MINUTES + SERVICE_TIME_PER_EXTRA_BOX_MINUTES * extra_boxes))
 
 UTILIZATION_FLAG_THRESHOLD = 22
 SHIFT_START_HOUR = 6
@@ -358,13 +367,36 @@ def build_osrm_local_matrices(locations):
                     time_min[i][j] = t / 60.0
     return dist_km, time_min
 
+# Neither OSRM's default profile nor the haversine fallback accounts for
+# actual traffic/congestion - both assume free-flow conditions (OSRM at
+# least varies speed by road type; the haversine fallback uses one flat
+# speed for everything). Rather than trying to model real traffic (which
+# needs a genuinely different, paid data source - see the tradeoffs
+# discussed with the dispatcher), this pads every travel-time estimate by
+# a conservative multiplier, applied AFTER the real distance/time lookup so
+# it's uniform regardless of source. Distance is untouched (it's a physical
+# fact); only the TIME estimate - and therefore the shift-length budget and
+# displayed ETAs - gets more conservative. 1.3 = assume routes take 30%
+# longer than free-flow, a reasonable buffer for typical urban/suburban
+# congestion without any real traffic data to calibrate against.
+TRAFFIC_TIME_MULTIPLIER = float(os.environ.get("TRAFFIC_TIME_MULTIPLIER", 1.3))
+
+
+def _apply_traffic_buffer(time_min):
+    n = len(time_min)
+    return [[time_min[i][j] * TRAFFIC_TIME_MULTIPLIER for j in range(n)] for i in range(n)]
+
+
 def build_distance_time_matrices(locations):
-    if os.environ.get("SKIP_OSM"): return build_haversine_matrices(locations)
+    if os.environ.get("SKIP_OSM"):
+        dist_km, time_min = build_haversine_matrices(locations)
+        return dist_km, _apply_traffic_buffer(time_min)
     try:
-        return build_osrm_local_matrices(locations)
+        dist_km, time_min = build_osrm_local_matrices(locations)
     except Exception as e:
         print(f"[OSRM] Local routing server failed ({e}); falling back to haversine.")
-        return build_haversine_matrices(locations)
+        dist_km, time_min = build_haversine_matrices(locations)
+    return dist_km, _apply_traffic_buffer(time_min)
 
 def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + orders
@@ -384,7 +416,9 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 
     routing.AddDimension(routing.RegisterTransitCallback(time_cb), 0, SHIFT_LENGTH_MINUTES, True, "Time")
     routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(load_cb), 0, [VEHICLE_CAPACITY_BOX] * num_vehicles, True, "Capacity")
-    routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(stop_cb), 0, [len(orders)] * num_vehicles, True, "StopCount")
+    routing.AddDimensionWithVehicleCapacity(
+        routing.RegisterUnaryTransitCallback(stop_cb), 0,
+        [len(orders)] * num_vehicles, True, "StopCount")
 
     time_dim = routing.GetDimensionOrDie("Time")
 
