@@ -84,6 +84,7 @@ OUTPUT_SHEET = "Routing_Plan"
 BACKLOG_SHEET = "Routing_Backlog"
 SCENARIOS_SHEET = "Routing_Scenarios"
 GEOMETRY_SHEET = "Routing_Geometry"
+VEHICLE_SUMMARY_SHEET = "Routing_VehicleSummary"
 
 # ==========================================
 # GOOGLE SHEETS I/O
@@ -182,6 +183,7 @@ def write_routing_output(spreadsheet, route_date, scenarios):
         plan_sheet = f"{OUTPUT_SHEET}_{label}"
         backlog_sheet = f"{BACKLOG_SHEET}_{label}"
         geometry_sheet = f"{GEOMETRY_SHEET}_{label}"
+        vehicle_summary_sheet = f"{VEHICLE_SUMMARY_SHEET}_{label}"
 
         if result.get("error"):
             comparison_rows.append([route_date, n, 0, 0, 0, 0, 0, 0, f"FAILED: {result['error']}"])
@@ -220,6 +222,17 @@ def write_routing_output(spreadsheet, route_date, scenarios):
         _upsert_sheet_by_date(spreadsheet, geometry_sheet, [
             "Route Date", "Vehicle", "Geometry (JSON [[lat,lng],...])",
         ], geometry_rows, route_date)
+
+        # Per-vehicle summary (stops, box, distance, time, utilization) was
+        # already being computed for the scenario comparison totals below,
+        # but never persisted anywhere the dashboard could read it directly
+        # - this is what backs the per-vehicle stat cards.
+        _upsert_sheet_by_date(spreadsheet, vehicle_summary_sheet, [
+            "Route Date", "Vehicle", "Driver", "Stops", "Total Box",
+            "Total Distance (km)", "Total Time (min)", "Capacity Utilization (%)", "Flag",
+        ], [
+            [route_date] + row for row in result["summary"]
+        ], route_date)
 
         total_distance = round(sum(row[4] for row in result["summary"]), 2)
         total_stops = sum(row[2] for row in result["summary"])
