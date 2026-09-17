@@ -35,7 +35,24 @@ NUM_VEHICLES = len(VEHICLES)
 
 VEHICLE_CAPACITY_BOX = int(os.environ.get("VEHICLE_CAPACITY_BOX", 1200))
 SHIFT_LENGTH_MINUTES = int(os.environ.get("SHIFT_LENGTH_MINUTES", 600))
-SERVICE_TIME_MINUTES = int(os.environ.get("SERVICE_TIME_MINUTES", 15))
+# Service time per stop is now variable, not flat: base time (unloading
+# setup, paperwork) plus a per-box component (actual unload time scales
+# with how much is being dropped off) - mirrors how real dispatch/OptimoRoute-
+# style software models this, rather than treating a 2-box and 40-box stop
+# as taking the same time. SERVICE_TIME_MINUTES keeps its existing name/env
+# var (now meaning the BASE component) so the dashboard's existing Settings
+# field still works without any changes there; the per-box rate is new.
+SERVICE_TIME_BASE_MINUTES = int(os.environ.get("SERVICE_TIME_MINUTES", 15))
+SERVICE_TIME_PER_BOX_MINUTES = float(os.environ.get("SERVICE_TIME_PER_BOX_MINUTES", 1))
+
+
+def service_time_minutes(box_count):
+    """Total service (dwell) time at a stop, given its box count. Rounded
+    to a whole minute the SAME way everywhere it's used (the solver's own
+    time-budget accounting AND the displayed ETD), so the shift-length
+    constraint the solver actually enforces and what a dispatcher sees on
+    screen never silently drift apart."""
+    return int(round(SERVICE_TIME_BASE_MINUTES + SERVICE_TIME_PER_BOX_MINUTES * box_count))
 
 UTILIZATION_FLAG_THRESHOLD = 22
 SHIFT_START_HOUR = 6
@@ -357,7 +374,8 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     def dist_cb(f, t): return int(round(dist_km[manager.IndexToNode(f)][manager.IndexToNode(t)] * 1000))
     def time_cb(f, t):
         i, j = manager.IndexToNode(f), manager.IndexToNode(t)
-        return int(round(time_min[i][j] + (SERVICE_TIME_MINUTES if i != 0 else 0)))
+        service = service_time_minutes(locations[i].get("box", 0)) if i != 0 else 0
+        return int(round(time_min[i][j] + service))
     def load_cb(f): return int(round(locations[manager.IndexToNode(f)].get("box", 0)))
     def stop_cb(f): return 0 if manager.IndexToNode(f) == 0 else 1
 
@@ -405,6 +423,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
                 box += locations[node].get("box", 0)
                 dist += dist_km[prev][node]
                 arr_min = solution.Value(time_dim.CumulVar(idx))
+                stop_service_min = service_time_minutes(locations[node].get("box", 0))
                 v_route.append({
                     "vehicle": VEHICLES[v_id]["name"], "driver": VEHICLES[v_id]["driver"], "seq": seq,
                     "kode_fulfillment": locations[node]["kode_fulfillment"],
@@ -413,7 +432,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
                     "lat": locations[node]["lat"], "lng": locations[node]["lng"],
                     "box": locations[node].get("box", 0), "cumulative_box": box,
                     "eta": f"{(SHIFT_START_HOUR * 60 + arr_min) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + arr_min) % 60:02.0f}",
-                    "etd": f"{(SHIFT_START_HOUR * 60 + arr_min + SERVICE_TIME_MINUTES) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + arr_min + SERVICE_TIME_MINUTES) % 60:02.0f}",
+                    "etd": f"{(SHIFT_START_HOUR * 60 + arr_min + stop_service_min) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + arr_min + stop_service_min) % 60:02.0f}",
                     "distance_from_prev_km": dist_km[prev][node], "tanggal_masuk": locations[node]["tanggal_masuk"],
                 })
                 prev = node
