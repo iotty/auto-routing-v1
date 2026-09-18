@@ -429,14 +429,14 @@ OSRM_DEMO_MAX_POINTS = 100
 def build_osrm_demo_matrices(locations):
     if len(locations) > OSRM_DEMO_MAX_POINTS:
         raise RuntimeError(f"{len(locations)} points exceeds the demo server's practical "
-                            f"~{OSRM_DEMO_MAX_POINTS}-point limit for one table query.")
+                           f"~{OSRM_DEMO_MAX_POINTS}-point limit for one table query.")
 
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
     url = OSRM_DEMO_URL + coords
 
     print(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from the public demo server...")
     response = requests.get(url, params={"annotations": "distance,duration"}, timeout=30,
-                             headers={"User-Agent": "auto-routing-vrp/1.0"})
+                            headers={"User-Agent": "auto-routing-vrp/1.0"})
     response.raise_for_status()
     data = response.json()
 
@@ -530,10 +530,17 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
         
         # Cap age at 4 to prevent 64-bit integer overflow in OR-Tools (max ~9.2e18).
         # An H+3 order has a penalty of 10,000,000 * 100^3 = 10,000,000,000,000.
-        # This mathematically guarantees the solver will drop any number of newer orders 
-        # before it drops a single H+3 order.
         safe_age = min(age, 4)
-        penalty = int(PRIORITY_BASE_PENALTY * (PRIORITY_EXP_MULTIPLIER ** safe_age))
+        
+        # FIX: Add a distance tiebreaker. Subtracting a small factor based on distance 
+        # makes farther points slightly cheaper to drop. The solver will naturally 
+        # backlog the outer perimeter instead of leaving unserved stops in the middle.
+        base_penalty = int(PRIORITY_BASE_PENALTY * (PRIORITY_EXP_MULTIPLIER ** safe_age))
+        dist_to_depot_km = haversine_km(DEPOT_LAT, DEPOT_LNG, locations[idx]["lat"], locations[idx]["lng"])
+        tiebreaker = int(dist_to_depot_km * 100) 
+        
+        # Ensure the penalty doesn't fall below a safe floor
+        penalty = max(1_000_000, base_penalty - tiebreaker)
         
         routing.AddDisjunction([manager.NodeToIndex(idx)], penalty)
 
@@ -604,57 +611,40 @@ def _farthest_point_seeds(points, n_seeds, depot_lat, depot_lng):
     return seeds
 
 
-def _rebalance_clusters(clusters, seeds, capacity, max_move_distance_km=20.0):
-    """The initial nearest-seed greedy assignment can leave a sparse
-    geographic zone well under its fair share even with a stop-count cap
-    on the OTHER clusters, since capping only stops over-filling - it
-    doesn't pull orders toward an under-filled zone that simply doesn't
-    have many nearby orders on its own. This actively transfers the
-    least-disruptive orders (closest to the under-filled cluster's seed,
-    among those in the most over-filled cluster) until stop counts are
-    roughly even, respecting capacity throughout.
-
-    max_move_distance_km guards against the opposite failure: forcing
-    balance no matter what can drag a genuinely isolated order into a
-    distant cluster just to hit a stop-count target, undoing the whole
-    point of clustering by geography. A RATIO-based guard (e.g. "don't
-    move more than 1.5x farther than its old distance") doesn't work here
-    - when an order is already far from every seed, both its old and new
-    distances are large, so the ratio looks "fair" even though the
-    absolute move is catastrophic for that route's compactness. An
-    absolute cap avoids that: a move only happens if the order isn't more
-    than this many km from its NEW cluster's seed, full stop. Once every
-    remaining candidate would exceed that, rebalancing stops there and
-    accepts the remaining imbalance rather than sacrificing compactness.
-    """
+def _rebalance_clusters(clusters, seeds, capacity, stop_slack, max_move_distance_km=20.0):
+    """Rebalances clusters only if they exceed the allowable geographical density slack,
+    rather than forcing exact stop-count equality which ruins compact routes."""
     n = len(clusters)
     if n == 0 or len(seeds) != n:
-        return clusters  # can't reference seeds meaningfully in the padding edge case
+        return clusters
 
     def cluster_load(c):
         return sum(o.get("box", 0) for o in c)
 
-    max_iterations = sum(len(c) for c in clusters) * 2  # safety bound; should converge much faster
+    max_iterations = sum(len(c) for c in clusters) * 2
     for _ in range(max_iterations):
         under_idx = min(range(n), key=lambda i: len(clusters[i]))
         over_idx = max(range(n), key=lambda i: len(clusters[i]))
-        if len(clusters[over_idx]) - len(clusters[under_idx]) <= 1:
-            break  # as balanced as it can get
+        
+        # FIX: Stop rebalancing if the difference is within acceptable slack.
+        if len(clusters[over_idx]) - len(clusters[under_idx]) <= stop_slack:
+            break
 
         candidates = [
             o for o in clusters[over_idx]
             if cluster_load(clusters[under_idx]) + o.get("box", 0) <= capacity
         ]
         if not candidates:
-            break  # moving anything further would break capacity - stop here
+            break
 
         best_order = min(
             candidates,
             key=lambda o: haversine_km(o["lat"], o["lng"], seeds[under_idx][0], seeds[under_idx][1])
         )
         dist_to_new = haversine_km(best_order["lat"], best_order["lng"], seeds[under_idx][0], seeds[under_idx][1])
+        
         if dist_to_new > max_move_distance_km:
-            break  # every remaining candidate is now too far to move - stop, accept the imbalance
+            break
 
         clusters[over_idx].remove(best_order)
         clusters[under_idx].append(best_order)
@@ -670,17 +660,6 @@ def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_ln
     clusters) - callers rely on one list per vehicle, and a vehicle with
     nothing assigned should show up as an empty/idle route, not vanish
     from the output entirely.
-
-    Three things this balances, in priority order:
-    1. Geographic proximity (assign to the nearest cluster first) - this
-       is what keeps one vehicle from being stretched across the whole
-       territory to absorb a few isolated far-away orders.
-    2. A stop-count cap during initial assignment, so no cluster grows
-       unbounded while others are still empty.
-    3. An active rebalancing pass afterward (see _rebalance_clusters) -
-       the cap alone doesn't help a genuinely sparse zone reach its fair
-       share, since capping only prevents OTHER clusters from over-filling;
-       it doesn't pull orders toward the under-filled one.
     """
     if n_clusters <= 1 or not orders:
         return [orders] + [[] for _ in range(max(0, n_clusters - 1))]
@@ -691,7 +670,10 @@ def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_ln
     cluster_loads = [0.0] * len(seeds)
 
     target_stops = math.ceil(len(orders) / len(seeds))
-    stop_slack = max(2, math.ceil(target_stops * 0.15))  # ~15% slack, minimum 2
+    
+    # FIX: Significantly increase slack (e.g. 60%). A vehicle in a dense cluster 
+    # can comfortably handle many more stops than one in a sparse cluster.
+    stop_slack = max(10, math.ceil(target_stops * 0.6)) 
     max_stops_per_cluster = target_stops + stop_slack
 
     for order in orders:
@@ -701,12 +683,6 @@ def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_ln
         )
         order_box = order.get("box", 0)
         nearest_dist = haversine_km(order["lat"], order["lng"], seeds[candidates[0]][0], seeds[candidates[0]][1])
-        # "Reasonably near" = not much farther than the closest cluster -
-        # this is what stops a distant-but-technically-compliant cluster
-        # from ever being preferred over a near one just because the near
-        # one is full on stop count. A fixed multiplier alone breaks down
-        # when the closest cluster is very close (multiplying ~0 stays
-        # ~0), so this also has a minimum absolute allowance.
         near_threshold = max(nearest_dist * 2.0, nearest_dist + 5.0)
         nearby_candidates = [i for i in candidates
                               if haversine_km(order["lat"], order["lng"], seeds[i][0], seeds[i][1]) <= near_threshold]
@@ -752,7 +728,8 @@ def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_ln
             clusters[best_i].append(order)
             cluster_loads[best_i] += order_box
 
-    clusters = _rebalance_clusters(clusters, seeds, capacity)
+    # Pass the new stop_slack down to the rebalancer
+    clusters = _rebalance_clusters(clusters, seeds, capacity, stop_slack)
     return clusters
 
 
@@ -763,15 +740,7 @@ def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
     vehicle. Reuses the exact same solve_routing() machinery per cluster -
     including its priority-based backlog mechanism - just scoped to one
     vehicle and one zone's orders at a time.
-
-    Each cluster builds its OWN distance matrix (rather than slicing one
-    matrix pre-built for the whole order set). This matters: the public
-    OSRM demo server - the fallback tier used when the self-hosted OSRM
-    container isn't reachable - has a roughly 100-point limit per query.
-    A full day's orders can easily exceed that, but one cluster (~20-30
-    orders) usually doesn't, so building matrices per-cluster is what
-    actually lets that fallback tier help in practice instead of being
-    skipped for real order volumes."""
+    """
     clusters = cluster_orders_by_capacity(orders, n, VEHICLE_CAPACITY_BOX, depot_lat, depot_lng)
 
     all_routes, all_backlog, all_summary = [], [], []
