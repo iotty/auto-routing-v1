@@ -22,8 +22,20 @@ from ortools.constraint_solver import pywrapcp
 # ==========================================
 # CONFIG (Now dynamic via Apps Script / GitHub Actions)
 # ==========================================
-DEPOT_LAT = float(os.environ.get("DEPOT_LAT", -6.238931133669451))
-DEPOT_LNG = float(os.environ.get("DEPOT_LNG", 106.53540668179242))
+def _env_num(name, default, cast=float):
+    """Reads an env var as a number, treating an empty string the same as
+    "not set" - falls back to default instead of crashing. This matters
+    because a workflow_dispatch input left blank when triggered manually
+    from the GitHub UI is passed through as an empty string, not omitted
+    entirely, and int('') / float('') both raise."""
+    raw = os.environ.get(name, "")
+    if raw is None or str(raw).strip() == "":
+        return default
+    return cast(raw)
+
+
+DEPOT_LAT = _env_num("DEPOT_LAT", -6.238931133669451)
+DEPOT_LNG = _env_num("DEPOT_LNG", 106.53540668179242)
 DEPOT_NAME = "FF Bitung"
 
 VEHICLES = [
@@ -33,16 +45,16 @@ VEHICLES = [
 ]
 NUM_VEHICLES = len(VEHICLES)
 
-VEHICLE_CAPACITY_BOX = int(os.environ.get("VEHICLE_CAPACITY_BOX", 1200))
-SHIFT_LENGTH_MINUTES = int(os.environ.get("SHIFT_LENGTH_MINUTES", 600))
+VEHICLE_CAPACITY_BOX = int(_env_num("VEHICLE_CAPACITY_BOX", 1200))
+SHIFT_LENGTH_MINUTES = int(_env_num("SHIFT_LENGTH_MINUTES", 600))
 # Service time per stop is piecewise: a flat base for small orders (setup/
 # paperwork time dominates when there's not much to unload), then scaling
 # up per box once an order is big enough that unload time actually starts
 # to matter. Mirrors real dispatch software's variable-duration modeling
 # better than either a pure flat time or a pure linear-from-zero formula.
-SERVICE_TIME_BASE_MINUTES = int(os.environ.get("SERVICE_TIME_MINUTES", 15))
-SERVICE_TIME_FREE_BOX_THRESHOLD = int(os.environ.get("SERVICE_TIME_FREE_BOX_THRESHOLD", 6))
-SERVICE_TIME_PER_EXTRA_BOX_MINUTES = float(os.environ.get("SERVICE_TIME_PER_EXTRA_BOX_MINUTES", 1))
+SERVICE_TIME_BASE_MINUTES = int(_env_num("SERVICE_TIME_MINUTES", 15))
+SERVICE_TIME_FREE_BOX_THRESHOLD = int(_env_num("SERVICE_TIME_FREE_BOX_THRESHOLD", 6))
+SERVICE_TIME_PER_EXTRA_BOX_MINUTES = _env_num("SERVICE_TIME_PER_EXTRA_BOX_MINUTES", 1)
 
 
 def service_time_minutes(box_count):
@@ -411,7 +423,7 @@ def build_osrm_local_matrices(locations):
 # displayed ETAs - gets more conservative. 1.3 = assume routes take 30%
 # longer than free-flow, a reasonable buffer for typical urban/suburban
 # congestion without any real traffic data to calibrate against.
-TRAFFIC_TIME_MULTIPLIER = float(os.environ.get("TRAFFIC_TIME_MULTIPLIER", 1.3))
+TRAFFIC_TIME_MULTIPLIER = _env_num("TRAFFIC_TIME_MULTIPLIER", 1.3)
 
 
 def _apply_traffic_buffer(time_min):
