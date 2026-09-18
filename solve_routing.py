@@ -356,7 +356,7 @@ def _write_sheet(spreadsheet, sheet_name, header, rows, max_retries=4):
     for attempt in range(1, max_retries + 1):
         try:
             worksheet.clear()
-            if rows or header: worksheet.update("A1", [header] + rows)
+            if rows or header: worksheet.update(range_name="A1", values=[header] + rows)
             print(f"[{sheet_name}] wrote {len(rows)} row(s).")
             return True
         except gspread.exceptions.APIError as e:
@@ -411,6 +411,55 @@ def build_osrm_local_matrices(locations):
                     time_min[i][j] = t / 60.0
     return dist_km, time_min
 
+
+# Public OSRM demo server, called directly over the internet - independent
+# of your self-hosted Docker/OSRM setup entirely, since it's a completely
+# different service with a completely different failure mode. GitHub
+# Actions runners have unrestricted internet access, so this should reach
+# it even on a run where the local Docker container has an issue. It's a
+# "best effort, no uptime guarantee" public service (rate-limited, and
+# capped around 100 points per table query) - not something to rely on as
+# the ONLY path, but genuine redundancy before falling all the way back to
+# straight-line distance, which is what was producing routes that looked
+# efficient "as the crow flies" but required absurd real-road detours.
+OSRM_DEMO_URL = "https://router.project-osrm.org/table/v1/driving/"
+OSRM_DEMO_MAX_POINTS = 100
+
+
+def build_osrm_demo_matrices(locations):
+    if len(locations) > OSRM_DEMO_MAX_POINTS:
+        raise RuntimeError(f"{len(locations)} points exceeds the demo server's practical "
+                            f"~{OSRM_DEMO_MAX_POINTS}-point limit for one table query.")
+
+    coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
+    url = OSRM_DEMO_URL + coords
+
+    print(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from the public demo server...")
+    response = requests.get(url, params={"annotations": "distance,duration"}, timeout=30,
+                             headers={"User-Agent": "auto-routing-vrp/1.0"})
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("code") != "Ok":
+        raise RuntimeError(f"OSRM demo server returned: {data.get('code')} - {data.get('message', '')}")
+
+    distances_m, durations_s = data["distances"], data["durations"]
+    n = len(locations)
+    dist_km, time_min = [[0.0] * n for _ in range(n)], [[0.0] * n for _ in range(n)]
+
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                d, t = distances_m[i][j], durations_s[i][j]
+                if d is None or t is None:
+                    km = haversine_km(locations[i]["lat"], locations[i]["lng"], locations[j]["lat"], locations[j]["lng"])
+                    dist_km[i][j] = km
+                    time_min[i][j] = (km / AVG_SPEED_KMH_FALLBACK) * 60.0
+                else:
+                    dist_km[i][j] = d / 1000.0
+                    time_min[i][j] = t / 60.0
+    return dist_km, time_min
+
 # Neither OSRM's default profile nor the haversine fallback accounts for
 # actual traffic/congestion - both assume free-flow conditions (OSRM at
 # least varies speed by road type; the haversine fallback uses one flat
@@ -435,11 +484,20 @@ def build_distance_time_matrices(locations):
     if os.environ.get("SKIP_OSM"):
         dist_km, time_min = build_haversine_matrices(locations)
         return dist_km, _apply_traffic_buffer(time_min)
+
     try:
         dist_km, time_min = build_osrm_local_matrices(locations)
+        return dist_km, _apply_traffic_buffer(time_min)
     except Exception as e:
-        print(f"[OSRM] Local routing server failed ({e}); falling back to haversine.")
-        dist_km, time_min = build_haversine_matrices(locations)
+        print(f"[OSRM] Local routing server failed ({e}); trying the public OSRM demo server next.")
+
+    try:
+        dist_km, time_min = build_osrm_demo_matrices(locations)
+        return dist_km, _apply_traffic_buffer(time_min)
+    except Exception as e:
+        print(f"[OSRM-demo] Also failed ({e}); falling back to straight-line distance.")
+
+    dist_km, time_min = build_haversine_matrices(locations)
     return dist_km, _apply_traffic_buffer(time_min)
 
 def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
@@ -698,20 +756,23 @@ def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_ln
     return clusters
 
 
-def solve_clustered_scenario(orders, route_date, n, dist_km, time_min):
+def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
     """Multi-vehicle scenarios: cluster orders into n compact geographic
     zones FIRST, then solve each zone as its own independent single-vehicle
     route, instead of one joint solver freely assigning any order to any
     vehicle. Reuses the exact same solve_routing() machinery per cluster -
     including its priority-based backlog mechanism - just scoped to one
-    vehicle and one zone's orders at a time."""
-    clusters = cluster_orders_by_capacity(orders, n, VEHICLE_CAPACITY_BOX, DEPOT_LAT, DEPOT_LNG)
+    vehicle and one zone's orders at a time.
 
-    # Map each order to its position in the GLOBAL locations list (index 0
-    # is the depot in dist_km/time_min; index i+1 is orders[i]) so each
-    # cluster's sub-matrix can be sliced out of the already-computed full
-    # matrix without recomputing any distances.
-    global_index = {id(o): i + 1 for i, o in enumerate(orders)}
+    Each cluster builds its OWN distance matrix (rather than slicing one
+    matrix pre-built for the whole order set). This matters: the public
+    OSRM demo server - the fallback tier used when the self-hosted OSRM
+    container isn't reachable - has a roughly 100-point limit per query.
+    A full day's orders can easily exceed that, but one cluster (~20-30
+    orders) usually doesn't, so building matrices per-cluster is what
+    actually lets that fallback tier help in practice instead of being
+    skipped for real order volumes."""
+    clusters = cluster_orders_by_capacity(orders, n, VEHICLE_CAPACITY_BOX, depot_lat, depot_lng)
 
     all_routes, all_backlog, all_summary = [], [], []
     for cluster_idx, cluster_orders in enumerate(clusters):
@@ -724,9 +785,8 @@ def solve_clustered_scenario(orders, route_date, n, dist_km, time_min):
             all_summary.append([vehicle["name"], vehicle["driver"], 0, 0, 0.0, 0, 0, ""])
             continue
 
-        indices = [0] + [global_index[id(o)] for o in cluster_orders]
-        sub_dist = [[dist_km[gi][gj] for gj in indices] for gi in indices]
-        sub_time = [[time_min[gi][gj] for gj in indices] for gi in indices]
+        cluster_locations = [{"lat": depot_lat, "lng": depot_lng}] + cluster_orders
+        sub_dist, sub_time = build_distance_time_matrices(cluster_locations)
 
         routes, backlog, summary = solve_routing(cluster_orders, route_date, 1, sub_dist, sub_time)
 
@@ -748,16 +808,16 @@ def solve_clustered_scenario(orders, route_date, n, dist_km, time_min):
 
 
 def solve_all_scenarios(orders, route_date):
-    locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + orders
-    dist_km, time_min = build_distance_time_matrices(locations)
     scenarios = {}
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
             if n == 1:
+                locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + orders
+                dist_km, time_min = build_distance_time_matrices(locations)
                 r, b, s = solve_routing(orders, route_date, 1, dist_km, time_min)
             else:
-                r, b, s = solve_clustered_scenario(orders, route_date, n, dist_km, time_min)
+                r, b, s = solve_clustered_scenario(orders, route_date, n, DEPOT_LAT, DEPOT_LNG)
             print(f"  Served {sum(row[2] for row in s)}/{len(orders)}, backlog {len(b)}, dist {sum(row[4] for row in s):.1f}km")
             scenarios[n] = {"routes": r, "backlog": b, "summary": s}
         except Exception as e:
