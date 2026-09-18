@@ -13,13 +13,22 @@ on:
         description: 'Shift Length (Minutes)'
         required: false
       service_time:
-        description: 'Service Time (Minutes)'
+        description: 'Base Service Time (Minutes)'
         required: false
       depot_lat:
         description: 'Depot Latitude'
         required: false
       depot_lng:
         description: 'Depot Longitude'
+        required: false
+      service_free_box_threshold:
+        description: 'Free service time up to (boxes)'
+        required: false
+      service_per_extra_box_minutes:
+        description: 'Extra service minutes per box beyond the threshold'
+        required: false
+      traffic_multiplier:
+        description: 'Traffic time multiplier (1.3 = assume 30% slower than free-flow)'
         required: false
 
 jobs:
@@ -69,4 +78,7 @@ jobs:
           SERVICE_TIME_MINUTES: ${{ github.event.inputs.service_time }}
           DEPOT_LAT: ${{ github.event.inputs.depot_lat }}
           DEPOT_LNG: ${{ github.event.inputs.depot_lng }}
+          SERVICE_TIME_FREE_BOX_THRESHOLD: ${{ github.event.inputs.service_free_box_threshold }}
+          SERVICE_TIME_PER_EXTRA_BOX_MINUTES: ${{ github.event.inputs.service_per_extra_box_minutes }}
+          TRAFFIC_TIME_MULTIPLIER: ${{ github.event.inputs.traffic_multiplier }}
         run: python solve_routing.py
