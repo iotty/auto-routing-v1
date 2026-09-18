@@ -533,6 +533,111 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     backlog = [{**locations[i], "backlog_reason": "Capacity/time limit"} for i in range(1, len(locations)) if i not in visited]
     return routes, backlog, summary
 
+def _farthest_point_seeds(points, n_seeds, depot_lat, depot_lng):
+    """Picks n_seeds well-spread coordinates via farthest-point sampling -
+    each new seed is the point maximizing its minimum distance to all
+    seeds already chosen, so seeds start out geographically spread apart
+    rather than bunched together."""
+    if not points:
+        return []
+    seeds = [max(points, key=lambda p: haversine_km(p[0], p[1], depot_lat, depot_lng))]
+    while len(seeds) < n_seeds and len(seeds) < len(points):
+        seeds.append(max(points, key=lambda p: min(haversine_km(p[0], p[1], s[0], s[1]) for s in seeds)))
+    return seeds
+
+
+def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_lng):
+    """Greedily partitions orders into n_clusters geographically-compact
+    groups, each respecting `capacity`. ALWAYS returns exactly n_clusters
+    lists (padded with empty lists if there aren't enough distinct order
+    locations to seed that many clusters) - callers rely on one list per
+    vehicle, and a vehicle with nothing assigned should show up as an
+    empty/idle route, not vanish from the output entirely. This is what
+    keeps one vehicle from being stretched across the whole territory to
+    absorb a few isolated far-away orders - each vehicle gets its own zone
+    instead of the solver freely assigning any order to any vehicle purely
+    by marginal distance."""
+    if n_clusters <= 1 or not orders:
+        return [orders] + [[] for _ in range(max(0, n_clusters - 1))]
+
+    points = [(o["lat"], o["lng"]) for o in orders]
+    seeds = _farthest_point_seeds(points, n_clusters, depot_lat, depot_lng)
+    clusters = [[] for _ in range(n_clusters)]  # always n_clusters slots, even if fewer seeds
+    cluster_loads = [0.0] * len(seeds)
+
+    for order in orders:
+        candidates = sorted(
+            range(len(seeds)),
+            key=lambda i: haversine_km(order["lat"], order["lng"], seeds[i][0], seeds[i][1])
+        )
+        placed = False
+        for i in candidates:
+            if cluster_loads[i] + order.get("box", 0) <= capacity:
+                clusters[i].append(order)
+                cluster_loads[i] += order.get("box", 0)
+                placed = True
+                break
+        if not placed:
+            # Every cluster is already at capacity - assign to the nearest
+            # one anyway; that vehicle's own capacity dimension in the
+            # solver will backlog it via the normal priority mechanism if
+            # it genuinely doesn't fit, same as it always has.
+            best_i = candidates[0]
+            clusters[best_i].append(order)
+            cluster_loads[best_i] += order.get("box", 0)
+
+    return clusters
+
+
+def solve_clustered_scenario(orders, route_date, n, dist_km, time_min):
+    """Multi-vehicle scenarios: cluster orders into n compact geographic
+    zones FIRST, then solve each zone as its own independent single-vehicle
+    route, instead of one joint solver freely assigning any order to any
+    vehicle. Reuses the exact same solve_routing() machinery per cluster -
+    including its priority-based backlog mechanism - just scoped to one
+    vehicle and one zone's orders at a time."""
+    clusters = cluster_orders_by_capacity(orders, n, VEHICLE_CAPACITY_BOX, DEPOT_LAT, DEPOT_LNG)
+
+    # Map each order to its position in the GLOBAL locations list (index 0
+    # is the depot in dist_km/time_min; index i+1 is orders[i]) so each
+    # cluster's sub-matrix can be sliced out of the already-computed full
+    # matrix without recomputing any distances.
+    global_index = {id(o): i + 1 for i, o in enumerate(orders)}
+
+    all_routes, all_backlog, all_summary = [], [], []
+    for cluster_idx, cluster_orders in enumerate(clusters):
+        if cluster_idx >= NUM_VEHICLES:
+            all_backlog.extend([{**o, "backlog_reason": "No vehicle available for this cluster"} for o in cluster_orders])
+            continue
+
+        vehicle = VEHICLES[cluster_idx]
+        if not cluster_orders:
+            all_summary.append([vehicle["name"], vehicle["driver"], 0, 0, 0.0, 0, 0, ""])
+            continue
+
+        indices = [0] + [global_index[id(o)] for o in cluster_orders]
+        sub_dist = [[dist_km[gi][gj] for gj in indices] for gi in indices]
+        sub_time = [[time_min[gi][gj] for gj in indices] for gi in indices]
+
+        routes, backlog, summary = solve_routing(cluster_orders, route_date, 1, sub_dist, sub_time)
+
+        # solve_routing always labels a lone vehicle as VEHICLES[0]
+        # internally - relabel to this cluster's actual assigned vehicle.
+        for r in routes:
+            r["vehicle"] = vehicle["name"]
+            r["driver"] = vehicle["driver"]
+            r["nopol"] = vehicle.get("nopol", "")
+        for s in summary:
+            s[0] = vehicle["name"]
+            s[1] = vehicle["driver"]
+
+        all_routes.extend(routes)
+        all_backlog.extend(backlog)
+        all_summary.extend(summary)
+
+    return all_routes, all_backlog, all_summary
+
+
 def solve_all_scenarios(orders, route_date):
     locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + orders
     dist_km, time_min = build_distance_time_matrices(locations)
@@ -540,7 +645,10 @@ def solve_all_scenarios(orders, route_date):
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
-            r, b, s = solve_routing(orders, route_date, n, dist_km, time_min)
+            if n == 1:
+                r, b, s = solve_routing(orders, route_date, 1, dist_km, time_min)
+            else:
+                r, b, s = solve_clustered_scenario(orders, route_date, n, dist_km, time_min)
             print(f"  Served {sum(row[2] for row in s)}/{len(orders)}, backlog {len(b)}, dist {sum(row[4] for row in s):.1f}km")
             scenarios[n] = {"routes": r, "backlog": b, "summary": s}
         except Exception as e:
