@@ -218,10 +218,10 @@ def write_routing_output(spreadsheet, route_date, scenarios):
 
         _upsert_sheet_by_date(spreadsheet, backlog_sheet, [
             "Route Date", "Kode Fulfillment", "Nama Penerima", "Alamat Penerima",
-            "Box", "Tanggal Fulfillment Masuk FF", "Reason",
+            "Latitude", "Longitude", "Box", "Tanggal Fulfillment Masuk FF", "Reason",
         ], [
             [route_date, b["kode_fulfillment"], b["nama_penerima"], b["alamat_penerima"],
-             b["box"], b["tanggal_masuk"], b.get("backlog_reason", "Backlogged")]
+             b["lat"], b["lng"], b["box"], b["tanggal_masuk"], b.get("backlog_reason", "Backlogged")]
             for b in result["backlog"]
         ], route_date)
 
@@ -546,17 +546,84 @@ def _farthest_point_seeds(points, n_seeds, depot_lat, depot_lng):
     return seeds
 
 
+def _rebalance_clusters(clusters, seeds, capacity, max_move_distance_km=20.0):
+    """The initial nearest-seed greedy assignment can leave a sparse
+    geographic zone well under its fair share even with a stop-count cap
+    on the OTHER clusters, since capping only stops over-filling - it
+    doesn't pull orders toward an under-filled zone that simply doesn't
+    have many nearby orders on its own. This actively transfers the
+    least-disruptive orders (closest to the under-filled cluster's seed,
+    among those in the most over-filled cluster) until stop counts are
+    roughly even, respecting capacity throughout.
+
+    max_move_distance_km guards against the opposite failure: forcing
+    balance no matter what can drag a genuinely isolated order into a
+    distant cluster just to hit a stop-count target, undoing the whole
+    point of clustering by geography. A RATIO-based guard (e.g. "don't
+    move more than 1.5x farther than its old distance") doesn't work here
+    - when an order is already far from every seed, both its old and new
+    distances are large, so the ratio looks "fair" even though the
+    absolute move is catastrophic for that route's compactness. An
+    absolute cap avoids that: a move only happens if the order isn't more
+    than this many km from its NEW cluster's seed, full stop. Once every
+    remaining candidate would exceed that, rebalancing stops there and
+    accepts the remaining imbalance rather than sacrificing compactness.
+    """
+    n = len(clusters)
+    if n == 0 or len(seeds) != n:
+        return clusters  # can't reference seeds meaningfully in the padding edge case
+
+    def cluster_load(c):
+        return sum(o.get("box", 0) for o in c)
+
+    max_iterations = sum(len(c) for c in clusters) * 2  # safety bound; should converge much faster
+    for _ in range(max_iterations):
+        under_idx = min(range(n), key=lambda i: len(clusters[i]))
+        over_idx = max(range(n), key=lambda i: len(clusters[i]))
+        if len(clusters[over_idx]) - len(clusters[under_idx]) <= 1:
+            break  # as balanced as it can get
+
+        candidates = [
+            o for o in clusters[over_idx]
+            if cluster_load(clusters[under_idx]) + o.get("box", 0) <= capacity
+        ]
+        if not candidates:
+            break  # moving anything further would break capacity - stop here
+
+        best_order = min(
+            candidates,
+            key=lambda o: haversine_km(o["lat"], o["lng"], seeds[under_idx][0], seeds[under_idx][1])
+        )
+        dist_to_new = haversine_km(best_order["lat"], best_order["lng"], seeds[under_idx][0], seeds[under_idx][1])
+        if dist_to_new > max_move_distance_km:
+            break  # every remaining candidate is now too far to move - stop, accept the imbalance
+
+        clusters[over_idx].remove(best_order)
+        clusters[under_idx].append(best_order)
+
+    return clusters
+
+
 def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_lng):
     """Greedily partitions orders into n_clusters geographically-compact
-    groups, each respecting `capacity`. ALWAYS returns exactly n_clusters
-    lists (padded with empty lists if there aren't enough distinct order
-    locations to seed that many clusters) - callers rely on one list per
-    vehicle, and a vehicle with nothing assigned should show up as an
-    empty/idle route, not vanish from the output entirely. This is what
-    keeps one vehicle from being stretched across the whole territory to
-    absorb a few isolated far-away orders - each vehicle gets its own zone
-    instead of the solver freely assigning any order to any vehicle purely
-    by marginal distance."""
+    groups, each respecting `capacity` AND a roughly-equal stop count.
+    ALWAYS returns exactly n_clusters lists (padded with empty lists if
+    there aren't enough distinct order locations to seed that many
+    clusters) - callers rely on one list per vehicle, and a vehicle with
+    nothing assigned should show up as an empty/idle route, not vanish
+    from the output entirely.
+
+    Three things this balances, in priority order:
+    1. Geographic proximity (assign to the nearest cluster first) - this
+       is what keeps one vehicle from being stretched across the whole
+       territory to absorb a few isolated far-away orders.
+    2. A stop-count cap during initial assignment, so no cluster grows
+       unbounded while others are still empty.
+    3. An active rebalancing pass afterward (see _rebalance_clusters) -
+       the cap alone doesn't help a genuinely sparse zone reach its fair
+       share, since capping only prevents OTHER clusters from over-filling;
+       it doesn't pull orders toward the under-filled one.
+    """
     if n_clusters <= 1 or not orders:
         return [orders] + [[] for _ in range(max(0, n_clusters - 1))]
 
@@ -565,27 +632,69 @@ def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_ln
     clusters = [[] for _ in range(n_clusters)]  # always n_clusters slots, even if fewer seeds
     cluster_loads = [0.0] * len(seeds)
 
+    target_stops = math.ceil(len(orders) / len(seeds))
+    stop_slack = max(2, math.ceil(target_stops * 0.15))  # ~15% slack, minimum 2
+    max_stops_per_cluster = target_stops + stop_slack
+
     for order in orders:
         candidates = sorted(
             range(len(seeds)),
             key=lambda i: haversine_km(order["lat"], order["lng"], seeds[i][0], seeds[i][1])
         )
+        order_box = order.get("box", 0)
+        nearest_dist = haversine_km(order["lat"], order["lng"], seeds[candidates[0]][0], seeds[candidates[0]][1])
+        # "Reasonably near" = not much farther than the closest cluster -
+        # this is what stops a distant-but-technically-compliant cluster
+        # from ever being preferred over a near one just because the near
+        # one is full on stop count. A fixed multiplier alone breaks down
+        # when the closest cluster is very close (multiplying ~0 stays
+        # ~0), so this also has a minimum absolute allowance.
+        near_threshold = max(nearest_dist * 2.0, nearest_dist + 5.0)
+        nearby_candidates = [i for i in candidates
+                              if haversine_km(order["lat"], order["lng"], seeds[i][0], seeds[i][1]) <= near_threshold]
+
         placed = False
-        for i in candidates:
-            if cluster_loads[i] + order.get("box", 0) <= capacity:
+
+        # Tier 1: among NEARBY clusters only, one satisfying both capacity
+        # and the stop-count cap - the ideal case.
+        for i in nearby_candidates:
+            if cluster_loads[i] + order_box <= capacity and len(clusters[i]) < max_stops_per_cluster:
                 clusters[i].append(order)
-                cluster_loads[i] += order.get("box", 0)
+                cluster_loads[i] += order_box
                 placed = True
                 break
+
+        # Tier 2: among NEARBY clusters only, the nearest one with at
+        # least capacity room - exceeding its stop-count cap is far
+        # preferable to jumping to a distant cluster that happens to
+        # still be under its cap.
         if not placed:
-            # Every cluster is already at capacity - assign to the nearest
-            # one anyway; that vehicle's own capacity dimension in the
-            # solver will backlog it via the normal priority mechanism if
-            # it genuinely doesn't fit, same as it always has.
+            for i in nearby_candidates:
+                if cluster_loads[i] + order_box <= capacity:
+                    clusters[i].append(order)
+                    cluster_loads[i] += order_box
+                    placed = True
+                    break
+
+        # Tier 3: every nearby cluster is genuinely full on capacity too -
+        # NOW it's reasonable to look farther afield, among ALL clusters.
+        if not placed:
+            for i in candidates:
+                if cluster_loads[i] + order_box <= capacity:
+                    clusters[i].append(order)
+                    cluster_loads[i] += order_box
+                    placed = True
+                    break
+
+        # Tier 4: every cluster is over capacity, full stop - place in the
+        # nearest one regardless; the solver's own capacity dimension will
+        # backlog it via the normal priority mechanism, same as always.
+        if not placed:
             best_i = candidates[0]
             clusters[best_i].append(order)
-            cluster_loads[best_i] += order.get("box", 0)
+            cluster_loads[best_i] += order_box
 
+    clusters = _rebalance_clusters(clusters, seeds, capacity)
     return clusters
 
 
