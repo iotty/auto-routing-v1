@@ -3,7 +3,8 @@ Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
 3 vehicles subject to capacity/time constraints, and writes the
-plan to Google Sheets. Backlogs older orders last.
+plan to Google Sheets. Backlogs older orders last, utilizing strict 
+geographic clustering for clean route territories.
 """
 
 import os
@@ -24,10 +25,7 @@ from ortools.constraint_solver import pywrapcp
 # ==========================================
 def _env_num(name, default, cast=float):
     """Reads an env var as a number, treating an empty string the same as
-    "not set" - falls back to default instead of crashing. This matters
-    because a workflow_dispatch input left blank when triggered manually
-    from the GitHub UI is passed through as an empty string, not omitted
-    entirely, and int('') / float('') both raise."""
+    "not set" - falls back to default instead of crashing."""
     raw = os.environ.get(name, "")
     if raw is None or str(raw).strip() == "":
         return default
@@ -47,29 +45,12 @@ NUM_VEHICLES = len(VEHICLES)
 
 VEHICLE_CAPACITY_BOX = int(_env_num("VEHICLE_CAPACITY_BOX", 1200))
 SHIFT_LENGTH_MINUTES = int(_env_num("SHIFT_LENGTH_MINUTES", 600))
-# Service time per stop is piecewise: a flat base for small orders (setup/
-# paperwork time dominates when there's not much to unload), then scaling
-# up per box once an order is big enough that unload time actually starts
-# to matter. Mirrors real dispatch software's variable-duration modeling
-# better than either a pure flat time or a pure linear-from-zero formula.
 SERVICE_TIME_BASE_MINUTES = int(_env_num("SERVICE_TIME_MINUTES", 15))
 SERVICE_TIME_FREE_BOX_THRESHOLD = int(_env_num("SERVICE_TIME_FREE_BOX_THRESHOLD", 6))
 SERVICE_TIME_PER_EXTRA_BOX_MINUTES = _env_num("SERVICE_TIME_PER_EXTRA_BOX_MINUTES", 1)
 
 
 def service_time_minutes(box_count):
-    """Total service (dwell) time at a stop, given its box count. Rounded
-    to a whole minute the SAME way everywhere it's used (the solver's own
-    time-budget accounting AND the displayed ETD), so the shift-length
-    constraint the solver actually enforces and what a dispatcher sees on
-    screen never silently drift apart.
-
-    < SERVICE_TIME_FREE_BOX_THRESHOLD boxes: flat SERVICE_TIME_BASE_MINUTES.
-    >= threshold: base + (box_count - (threshold - 1)) extra minutes, i.e.
-    the boxes AT and ABOVE the threshold are what add time, not the whole
-    count from zero. Example with defaults (base=15, threshold=6, rate=1):
-    5 boxes -> 15 min, 6 boxes -> 16 min, 10 boxes -> 20 min.
-    """
     if box_count < SERVICE_TIME_FREE_BOX_THRESHOLD:
         return SERVICE_TIME_BASE_MINUTES
     extra_boxes = box_count - (SERVICE_TIME_FREE_BOX_THRESHOLD - 1)
@@ -80,20 +61,11 @@ SHIFT_START_HOUR = 6
 AVG_SPEED_KMH_FALLBACK = 25
 
 # Base penalty prevents dropping new orders to save distance.
-# Exponential multiplier ensures older orders always outrank newer ones.
-# A brand-new order's penalty for being backlogged. Distance costs are in
-# the same units (km * 1000), so this is directly comparable to a detour
-# distance: e.g. 15,000 means "worth serving unless it costs more than
-# ~15km of extra driving to reach." Lower than the previous default
-# (10,000,000, a 500x bias against ever backlogging even a brand-new
-# order) - that extreme value was set to fix an earlier problem (orders
-# dropped to save a few km) but over-corrected into never letting the
-# solver weigh "is this one isolated order worth a 20-30km detour today,
-# or better served once more orders accumulate in that area." The
-# exponential escalation below still makes an order effectively mandatory
-# within a day or two, so this doesn't reintroduce indefinite deferral.
-PRIORITY_BASE_PENALTY = int(_env_num("PRIORITY_BASE_PENALTY", 15_000))
-PRIORITY_EXP_MULTIPLIER = 100
+# Changed from Exponential to Additive/Linear to preserve geographic density!
+# E.g., Age 0 = 50k, Age 1 = 65k. Dropping two Age 0 orders (100k) is now WORSE 
+# than dropping one Age 1 order (65k), forcing the solver to clean dense areas.
+PRIORITY_BASE_PENALTY = int(_env_num("PRIORITY_BASE_PENALTY", 50_000))
+PRIORITY_AGE_BONUS = int(_env_num("PRIORITY_AGE_BONUS", 15_000))
 
 SOLVE_TIME_LIMIT_SECONDS = 15
 
@@ -137,9 +109,6 @@ def get_spreadsheet():
 
 
 def _safe_col(row, idx, col_name, default=""):
-    """Defensive column access: returns `default` if the column doesn't
-    exist in this sheet or the row is short, instead of raising - so an
-    optional field being absent never crashes the whole order load."""
     i = idx.get(col_name)
     if i is None or i >= len(row):
         return default
@@ -168,9 +137,6 @@ def load_orders(spreadsheet):
                 "alamat_penerima": row[idx["Alamat Penerima"]],
                 "lat": lat, "lng": lng, "box": box,
                 "tanggal_masuk": row[idx["Tanggal Fulfillment Masuk FF"]],
-                # Added for the ops-team XLSX export template - each
-                # defaults to "" if the column isn't present, rather than
-                # crashing order load over an optional field.
                 "nomor_awb": _safe_col(row, idx, "Nomor AWB"),
                 "kabupaten_kota": _safe_col(row, idx, "Kabupaten/Kota Penerima"),
                 "jam_masuk": _safe_col(row, idx, "Jam Fulfillment Masuk FF"),
@@ -191,14 +157,6 @@ def parse_date_flexible(value):
 
 
 def write_routing_output(spreadsheet, route_date, scenarios):
-    """
-    Writes one full plan per scenario, PRESERVING history across dates:
-    re-running for the same route_date replaces just that date's rows;
-    running for a different date adds alongside existing history rather
-    than overwriting it. This is what lets the dashboard correctly show
-    "no plan yet" for a date that's never been run, instead of always
-    showing whatever the last run happened to produce.
-    """
     comparison_rows = []
 
     for n, result in list(scenarios.items()):
@@ -236,20 +194,11 @@ def write_routing_output(spreadsheet, route_date, scenarios):
             for b in result["backlog"]
         ], route_date)
 
-        # Real road-following geometry, fetched ONCE here while the local
-        # OSRM server (started earlier in the GitHub Actions job) is still
-        # up - the dashboard reads this back later instead of needing any
-        # live map API call of its own, which is what made the browser-side
-        # map draw straight lines instead of real roads before.
         geometry_rows = build_geometry_rows(route_date, result["routes"])
         _upsert_sheet_by_date(spreadsheet, geometry_sheet, [
             "Route Date", "Vehicle", "Geometry (JSON [[lat,lng],...])",
         ], geometry_rows, route_date)
 
-        # Per-vehicle summary (stops, box, distance, time, utilization) was
-        # already being computed for the scenario comparison totals below,
-        # but never persisted anywhere the dashboard could read it directly
-        # - this is what backs the per-vehicle stat cards.
         _upsert_sheet_by_date(spreadsheet, vehicle_summary_sheet, [
             "Route Date", "Vehicle", "Driver", "Stops", "Total Box",
             "Total Distance (km)", "Total Time (min)", "Capacity Utilization (%)", "Flag",
@@ -276,8 +225,6 @@ def write_routing_output(spreadsheet, route_date, scenarios):
 
 
 def _read_sheet_rows(spreadsheet, sheet_name):
-    """Returns (header, rows) as plain lists, or (None, []) if the sheet
-    doesn't exist yet or has no data."""
     try:
         worksheet = spreadsheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
@@ -289,13 +236,6 @@ def _read_sheet_rows(spreadsheet, sheet_name):
 
 
 def _upsert_sheet_by_date(spreadsheet, sheet_name, header, new_rows, route_date, max_retries=4):
-    """
-    Like _write_sheet, but preserves history across dates instead of blindly
-    overwriting: existing rows whose "Route Date" (first column) does NOT
-    match route_date are kept as-is; rows matching route_date are replaced
-    with new_rows. Re-running for the same date is idempotent (no
-    duplicates); running for a new date adds alongside prior history.
-    """
     existing_header, existing_rows = _read_sheet_rows(spreadsheet, sheet_name)
 
     if existing_header and existing_header != header:
@@ -310,13 +250,6 @@ def _upsert_sheet_by_date(spreadsheet, sheet_name, header, new_rows, route_date,
 
 
 def fetch_route_geometry(depot_lat, depot_lng, stops):
-    """
-    stops: solver-ordered list of stop dicts with 'lat'/'lng'. Returns a
-    list of [lat, lng] pairs tracing the real road route (depot -> stops ->
-    depot) via the local OSRM server, or None if that call fails for any
-    reason - callers should fall back to straight lines for that one
-    vehicle rather than fail the whole run over a single geometry lookup.
-    """
     if not stops:
         return None
     coords = [(depot_lng, depot_lat)] + [(s["lng"], s["lat"]) for s in stops] + [(depot_lng, depot_lat)]
@@ -328,8 +261,6 @@ def fetch_route_geometry(depot_lat, depot_lng, stops):
         data = response.json()
         if data.get("code") != "Ok" or not data.get("routes"):
             return None
-        # GeoJSON coordinates are [lng, lat] - flip to [lat, lng] to match
-        # how coordinates are handled everywhere else in this system.
         coords_geojson = data["routes"][0]["geometry"]["coordinates"]
         return [[c[1], c[0]] for c in coords_geojson]
     except Exception as e:
@@ -338,11 +269,6 @@ def fetch_route_geometry(depot_lat, depot_lng, stops):
 
 
 def build_geometry_rows(route_date, routes):
-    """routes: flat list of stop dicts (solve_routing's return), grouped
-    here by vehicle. One row per vehicle that has stops AND whose OSRM
-    route call succeeded; vehicles with no stops or a failed geometry
-    lookup are simply omitted - the dashboard falls back to a straight
-    line for those specific vehicles."""
     by_vehicle = {}
     for r in routes:
         by_vehicle.setdefault(r["vehicle"], []).append(r)
@@ -422,17 +348,6 @@ def build_osrm_local_matrices(locations):
                     time_min[i][j] = t / 60.0
     return dist_km, time_min
 
-
-# Public OSRM demo server, called directly over the internet - independent
-# of your self-hosted Docker/OSRM setup entirely, since it's a completely
-# different service with a completely different failure mode. GitHub
-# Actions runners have unrestricted internet access, so this should reach
-# it even on a run where the local Docker container has an issue. It's a
-# "best effort, no uptime guarantee" public service (rate-limited, and
-# capped around 100 points per table query) - not something to rely on as
-# the ONLY path, but genuine redundancy before falling all the way back to
-# straight-line distance, which is what was producing routes that looked
-# efficient "as the crow flies" but required absurd real-road detours.
 OSRM_DEMO_URL = "https://router.project-osrm.org/table/v1/driving/"
 OSRM_DEMO_MAX_POINTS = 100
 
@@ -471,18 +386,7 @@ def build_osrm_demo_matrices(locations):
                     time_min[i][j] = t / 60.0
     return dist_km, time_min
 
-# Neither OSRM's default profile nor the haversine fallback accounts for
-# actual traffic/congestion - both assume free-flow conditions (OSRM at
-# least varies speed by road type; the haversine fallback uses one flat
-# speed for everything). Rather than trying to model real traffic (which
-# needs a genuinely different, paid data source - see the tradeoffs
-# discussed with the dispatcher), this pads every travel-time estimate by
-# a conservative multiplier, applied AFTER the real distance/time lookup so
-# it's uniform regardless of source. Distance is untouched (it's a physical
-# fact); only the TIME estimate - and therefore the shift-length budget and
-# displayed ETAs - gets more conservative. 1.3 = assume routes take 30%
-# longer than free-flow, a reasonable buffer for typical urban/suburban
-# congestion without any real traffic data to calibrate against.
+
 TRAFFIC_TIME_MULTIPLIER = _env_num("TRAFFIC_TIME_MULTIPLIER", 1.3)
 
 
@@ -539,12 +443,9 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
         order_date = parse_date_flexible(locations[idx].get("tanggal_masuk"))
         age = max(0, (route_date - order_date).days) if order_date else 0
         
-        # Cap age at 4 to prevent 64-bit integer overflow in OR-Tools (max ~9.2e18).
-        # An H+3 order has a penalty of 10,000,000 * 100^3 = 10,000,000,000,000.
-        # This mathematically guarantees the solver will drop any number of newer orders 
-        # before it drops a single H+3 order.
-        safe_age = min(age, 4)
-        penalty = int(PRIORITY_BASE_PENALTY * (PRIORITY_EXP_MULTIPLIER ** safe_age))
+        # Linear age penalty: respects older POs, but refuses to ruin route density
+        safe_age = min(age, 10)
+        penalty = int(PRIORITY_BASE_PENALTY + (PRIORITY_AGE_BONUS * safe_age))
         
         routing.AddDisjunction([manager.NodeToIndex(idx)], penalty)
 
@@ -603,10 +504,6 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     return routes, backlog, summary
 
 def _farthest_point_seeds(points, n_seeds, depot_lat, depot_lng):
-    """Picks n_seeds well-spread coordinates via farthest-point sampling -
-    each new seed is the point maximizing its minimum distance to all
-    seeds already chosen, so seeds start out geographically spread apart
-    rather than bunched together."""
     if not points:
         return []
     seeds = [max(points, key=lambda p: haversine_km(p[0], p[1], depot_lat, depot_lng))]
@@ -615,71 +512,35 @@ def _farthest_point_seeds(points, n_seeds, depot_lat, depot_lng):
     return seeds
 
 
-def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_lng):
-    """Greedily partitions orders into n_clusters geographically-compact
-    groups, each respecting `capacity`. ALWAYS returns exactly n_clusters
-    lists (padded with empty lists if there aren't enough distinct order
-    locations to seed that many clusters) - callers rely on one list per
-    vehicle, and a vehicle with nothing assigned should show up as an
-    empty/idle route, not vanish from the output entirely.
-
-    Pure density: each order goes to its nearest cluster with capacity
-    room, full stop - no stop-count balancing, no rebalancing pass. This
-    maximizes geographic compactness by construction (always picks the
-    closest available option), at the cost of potentially uneven stop
-    counts across vehicles when order density varies by area - that
-    trade-off is intentional, chosen over the balanced-but-less-compact
-    version this used to be.
+def cluster_orders_by_geography(orders, n_clusters, depot_lat, depot_lng):
+    """
+    Groups orders into STRICT geographic zones based on nearest seed.
+    Unlike capacity-constrained clustering, this allows a cluster to exceed 
+    vehicle capacity during assignment. The OR-Tools solver will then optimally 
+    select the densest core of orders to serve today and push the geographic 
+    outliers to the backlog, resulting in clean, non-overlapping territories.
     """
     if n_clusters <= 1 or not orders:
         return [orders] + [[] for _ in range(max(0, n_clusters - 1))]
 
     points = [(o["lat"], o["lng"]) for o in orders]
     seeds = _farthest_point_seeds(points, n_clusters, depot_lat, depot_lng)
-    clusters = [[] for _ in range(n_clusters)]  # always n_clusters slots, even if fewer seeds
-    cluster_loads = [0.0] * len(seeds)
+    clusters = [[] for _ in range(n_clusters)]
 
     for order in orders:
-        candidates = sorted(
+        # Strictly assign to the absolute nearest seed. No capacity check here.
+        best_i = min(
             range(len(seeds)),
             key=lambda i: haversine_km(order["lat"], order["lng"], seeds[i][0], seeds[i][1])
         )
-        order_box = order.get("box", 0)
-        placed = False
-        for i in candidates:
-            if cluster_loads[i] + order_box <= capacity:
-                clusters[i].append(order)
-                cluster_loads[i] += order_box
-                placed = True
-                break
-        if not placed:
-            # Every cluster is over capacity - place in the nearest one
-            # regardless; the solver's own capacity dimension will
-            # backlog it via the normal priority mechanism.
-            best_i = candidates[0]
-            clusters[best_i].append(order)
-            cluster_loads[best_i] += order_box
+        clusters[best_i].append(order)
 
     return clusters
 
 
 def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
-    """Multi-vehicle scenarios: cluster orders into n compact geographic
-    zones FIRST, then solve each zone as its own independent single-vehicle
-    route, instead of one joint solver freely assigning any order to any
-    vehicle. Reuses the exact same solve_routing() machinery per cluster -
-    including its priority-based backlog mechanism - just scoped to one
-    vehicle and one zone's orders at a time.
-
-    Each cluster builds its OWN distance matrix (rather than slicing one
-    matrix pre-built for the whole order set). This matters: the public
-    OSRM demo server - the fallback tier used when the self-hosted OSRM
-    container isn't reachable - has a roughly 100-point limit per query.
-    A full day's orders can easily exceed that, but one cluster (~20-30
-    orders) usually doesn't, so building matrices per-cluster is what
-    actually lets that fallback tier help in practice instead of being
-    skipped for real order volumes."""
-    clusters = cluster_orders_by_capacity(orders, n, VEHICLE_CAPACITY_BOX, depot_lat, depot_lng)
+    # Changed from capacity-based to strict geography-based clustering
+    clusters = cluster_orders_by_geography(orders, n, depot_lat, depot_lng)
 
     all_routes, all_backlog, all_summary = [], [], []
     for cluster_idx, cluster_orders in enumerate(clusters):
@@ -697,8 +558,6 @@ def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
 
         routes, backlog, summary = solve_routing(cluster_orders, route_date, 1, sub_dist, sub_time)
 
-        # solve_routing always labels a lone vehicle as VEHICLES[0]
-        # internally - relabel to this cluster's actual assigned vehicle.
         for r in routes:
             r["vehicle"] = vehicle["name"]
             r["driver"] = vehicle["driver"]
