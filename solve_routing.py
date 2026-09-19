@@ -81,7 +81,18 @@ AVG_SPEED_KMH_FALLBACK = 25
 
 # Base penalty prevents dropping new orders to save distance.
 # Exponential multiplier ensures older orders always outrank newer ones.
-PRIORITY_BASE_PENALTY = 10_000_000
+# A brand-new order's penalty for being backlogged. Distance costs are in
+# the same units (km * 1000), so this is directly comparable to a detour
+# distance: e.g. 15,000 means "worth serving unless it costs more than
+# ~15km of extra driving to reach." Lower than the previous default
+# (10,000,000, a 500x bias against ever backlogging even a brand-new
+# order) - that extreme value was set to fix an earlier problem (orders
+# dropped to save a few km) but over-corrected into never letting the
+# solver weigh "is this one isolated order worth a 20-30km detour today,
+# or better served once more orders accumulate in that area." The
+# exponential escalation below still makes an order effectively mandatory
+# within a day or two, so this doesn't reintroduce indefinite deferral.
+PRIORITY_BASE_PENALTY = int(_env_num("PRIORITY_BASE_PENALTY", 15_000))
 PRIORITY_EXP_MULTIPLIER = 100
 
 SOLVE_TIME_LIMIT_SECONDS = 15
@@ -257,11 +268,11 @@ def write_routing_output(spreadsheet, route_date, scenarios):
             round(total_distance / total_stops, 2) if total_stops else 0, plan_sheet,
         ])
 
-        _upsert_sheet_by_date(spreadsheet, SCENARIOS_SHEET, [
-            "Route Date", "Vehicles Available", "Vehicles Actually Used", "Stops Served",
-            "Stops Backlogged", "Total Box", "Total Distance (km)",
-            "Distance per Stop (km)", "See Plan Tab",
-        ], comparison_rows, route_date)
+    _upsert_sheet_by_date(spreadsheet, SCENARIOS_SHEET, [
+        "Route Date", "Vehicles Available", "Vehicles Actually Used", "Stops Served",
+        "Stops Backlogged", "Total Box", "Total Distance (km)",
+        "Distance per Stop (km)", "See Plan Tab",
+    ], comparison_rows, route_date)
 
 
 def _read_sheet_rows(spreadsheet, sheet_name):
@@ -429,14 +440,14 @@ OSRM_DEMO_MAX_POINTS = 100
 def build_osrm_demo_matrices(locations):
     if len(locations) > OSRM_DEMO_MAX_POINTS:
         raise RuntimeError(f"{len(locations)} points exceeds the demo server's practical "
-                           f"~{OSRM_DEMO_MAX_POINTS}-point limit for one table query.")
+                            f"~{OSRM_DEMO_MAX_POINTS}-point limit for one table query.")
 
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
     url = OSRM_DEMO_URL + coords
 
     print(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from the public demo server...")
     response = requests.get(url, params={"annotations": "distance,duration"}, timeout=30,
-                            headers={"User-Agent": "auto-routing-vrp/1.0"})
+                             headers={"User-Agent": "auto-routing-vrp/1.0"})
     response.raise_for_status()
     data = response.json()
 
@@ -605,60 +616,46 @@ def _farthest_point_seeds(points, n_seeds, depot_lat, depot_lng):
 
 
 def cluster_orders_by_capacity(orders, n_clusters, capacity, depot_lat, depot_lng):
-    """
-    Partitions orders geographically, enforcing ONLY the physical volume capacity.
-    Stops are assigned purely based on the closest distance to a cluster's center,
-    with no artificial balancing of stop counts across vehicles.
+    """Greedily partitions orders into n_clusters geographically-compact
+    groups, each respecting `capacity`. ALWAYS returns exactly n_clusters
+    lists (padded with empty lists if there aren't enough distinct order
+    locations to seed that many clusters) - callers rely on one list per
+    vehicle, and a vehicle with nothing assigned should show up as an
+    empty/idle route, not vanish from the output entirely.
+
+    Pure density: each order goes to its nearest cluster with capacity
+    room, full stop - no stop-count balancing, no rebalancing pass. This
+    maximizes geographic compactness by construction (always picks the
+    closest available option), at the cost of potentially uneven stop
+    counts across vehicles when order density varies by area - that
+    trade-off is intentional, chosen over the balanced-but-less-compact
+    version this used to be.
     """
     if n_clusters <= 1 or not orders:
         return [orders] + [[] for _ in range(max(0, n_clusters - 1))]
 
     points = [(o["lat"], o["lng"]) for o in orders]
-    # Initialize seeds using the existing farthest-point logic
-    centroids = _farthest_point_seeds(points, n_clusters, depot_lat, depot_lng)
-    
-    clusters = [[] for _ in range(n_clusters)]
-    cluster_loads = [0.0] * n_clusters
+    seeds = _farthest_point_seeds(points, n_clusters, depot_lat, depot_lng)
+    clusters = [[] for _ in range(n_clusters)]  # always n_clusters slots, even if fewer seeds
+    cluster_loads = [0.0] * len(seeds)
 
-    # Anchoring: Sort orders descending by distance to the depot. Assigning the 
-    # farthest orders first anchors the clusters at the outer edges of the delivery 
-    # zone and builds them inward toward the depot, preventing overlapping routes.
-    orders_sorted = sorted(
-        orders, 
-        key=lambda o: haversine_km(o["lat"], o["lng"], depot_lat, depot_lng), 
-        reverse=True
-    )
-
-    for order in orders_sorted:
-        order_box = order.get("box", 0)
-        
-        # Sort candidates strictly by physical distance to the cluster centroid
+    for order in orders:
         candidates = sorted(
-            range(n_clusters),
-            key=lambda i: haversine_km(order["lat"], order["lng"], centroids[i][0], centroids[i][1])
+            range(len(seeds)),
+            key=lambda i: haversine_km(order["lat"], order["lng"], seeds[i][0], seeds[i][1])
         )
-        
+        order_box = order.get("box", 0)
         placed = False
         for i in candidates:
-            # Capacity is the ONLY constraint checked here
             if cluster_loads[i] + order_box <= capacity:
                 clusters[i].append(order)
                 cluster_loads[i] += order_box
-                
-                # Rolling Centroids: Pull the cluster's center coordinates slightly 
-                # toward the newly added order so the territory grows dynamically.
-                current_len = len(clusters[i])
-                new_lat = ((centroids[i][0] * (current_len - 1)) + order["lat"]) / current_len
-                new_lng = ((centroids[i][1] * (current_len - 1)) + order["lng"]) / current_len
-                centroids[i] = (new_lat, new_lng)
-                
                 placed = True
                 break
-                
         if not placed:
-            # Fallback if every cluster is over capacity: 
-            # Assign to the closest one regardless. The OR-Tools solver's 
-            # own capacity dimension will backlog it via the normal priority mechanism.
+            # Every cluster is over capacity - place in the nearest one
+            # regardless; the solver's own capacity dimension will
+            # backlog it via the normal priority mechanism.
             best_i = candidates[0]
             clusters[best_i].append(order)
             cluster_loads[best_i] += order_box
