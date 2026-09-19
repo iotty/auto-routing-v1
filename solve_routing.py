@@ -3,7 +3,8 @@ Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
 3 vehicles subject to 9-hour time limits, and writes the plan to Google Sheets. 
-Sorts and clusters older orders first to guarantee strict priority routing.
+Prioritizes older POs first by anchoring greedy-capacity clusters around them,
+sweeping nearby points until full.
 """
 
 import os
@@ -20,16 +21,13 @@ from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
 # ==========================================
-# CONFIG (Now dynamic via Apps Script / GitHub Actions)
+# CONFIG
 # ==========================================
 def _env_num(name, default, cast=float):
-    """Reads an env var as a number, treating an empty string the same as
-    "not set" - falls back to default instead of crashing."""
     raw = os.environ.get(name, "")
     if raw is None or str(raw).strip() == "":
         return default
     return cast(raw)
-
 
 DEPOT_LAT = _env_num("DEPOT_LAT", -6.238931133669451)
 DEPOT_LNG = _env_num("DEPOT_LNG", 106.53540668179242)
@@ -44,7 +42,7 @@ NUM_VEHICLES = len(VEHICLES)
 
 VEHICLE_CAPACITY_BOX = int(_env_num("VEHICLE_CAPACITY_BOX", 1200))
 
-# Reduced to 9 hours (540 minutes) per user request
+# Fixed at 9 hours (540 minutes)
 SHIFT_LENGTH_MINUTES = int(_env_num("SHIFT_LENGTH_MINUTES", 540))
 
 SERVICE_TIME_BASE_MINUTES = int(_env_num("SERVICE_TIME_MINUTES", 15))
@@ -62,15 +60,13 @@ UTILIZATION_FLAG_THRESHOLD = 22
 SHIFT_START_HOUR = 6
 AVG_SPEED_KMH_FALLBACK = 25
 
-# Age bonus is now 10x the base penalty. This guarantees the solver will sweep 
-# the newest orders out of the route to make room for older POs, ensuring 
-# the oldest POs form the guaranteed core of every geographic cluster.
+# Exponential penalty protects the old POs if OR-Tools has to drop orders 
+# to meet the 9-hour time limit.
 PRIORITY_BASE_PENALTY = int(_env_num("PRIORITY_BASE_PENALTY", 10_000))
-PRIORITY_AGE_BONUS = int(_env_num("PRIORITY_AGE_BONUS", 100_000))
+PRIORITY_EXP_MULTIPLIER = 100
 
 SOLVE_TIME_LIMIT_SECONDS = 15
 
-# Pointing to the local OSRM server running in GitHub Actions
 OSRM_URL = os.environ.get("OSRM_URL", "http://localhost:5000/table/v1/driving/")
 OSRM_ROUTE_URL = os.environ.get("OSRM_ROUTE_URL", "http://localhost:5000/route/v1/driving/")
 OSRM_MAX_POINTS = 5000
@@ -177,7 +173,7 @@ def write_routing_output(spreadsheet, route_date, scenarios):
             "Box (this stop)", "Cumulative Box", "ETA", "ETD",
             "Distance from Prev (km)", "Tanggal Fulfillment Masuk FF",
             "Nomor AWB", "Jam Fulfillment Masuk FF", "Jumlah BKU",
-            "Age (Days)",  # Added Age column to output for visibility
+            "Age (Days)", 
         ], [
             [route_date, r["vehicle"], r["driver"], r["nopol"], r["seq"], r["kode_fulfillment"],
              r["nama_penerima"], r["alamat_penerima"], r["kabupaten_kota"], r["lat"], r["lng"],
@@ -353,7 +349,6 @@ def build_osrm_local_matrices(locations):
 OSRM_DEMO_URL = "https://router.project-osrm.org/table/v1/driving/"
 OSRM_DEMO_MAX_POINTS = 100
 
-
 def build_osrm_demo_matrices(locations):
     if len(locations) > OSRM_DEMO_MAX_POINTS:
         raise RuntimeError(f"{len(locations)} points exceeds the demo server's practical "
@@ -388,14 +383,11 @@ def build_osrm_demo_matrices(locations):
                     time_min[i][j] = t / 60.0
     return dist_km, time_min
 
-
 TRAFFIC_TIME_MULTIPLIER = _env_num("TRAFFIC_TIME_MULTIPLIER", 1.3)
-
 
 def _apply_traffic_buffer(time_min):
     n = len(time_min)
     return [[time_min[i][j] * TRAFFIC_TIME_MULTIPLIER for j in range(n)] for i in range(n)]
-
 
 def build_distance_time_matrices(locations):
     if os.environ.get("SKIP_OSM"):
@@ -442,13 +434,12 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     time_dim = routing.GetDimensionOrDie("Time")
 
     for idx in range(1, len(locations)):
-        # Retrieve the age that was pre-calculated and sorted in main()
         age = locations[idx].get("age", 0)
         
-        # Massive age bonus guarantees the solver forces older POs into the route, 
-        # dropping brand new geographic outliers instead.
-        safe_age = min(age, 10)
-        penalty = int(PRIORITY_BASE_PENALTY + (PRIORITY_AGE_BONUS * safe_age))
+        # Exponential calculation ensures OR-Tools protects the old anchors 
+        # if it needs to trim the cluster to meet the 9-hour limit.
+        safe_age = min(age, 4)
+        penalty = int(PRIORITY_BASE_PENALTY * (PRIORITY_EXP_MULTIPLIER ** safe_age))
         
         routing.AddDisjunction([manager.NodeToIndex(idx)], penalty)
 
@@ -504,47 +495,62 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
             f"Consider backlogging - only {seq} stops" if 0 < seq < UTILIZATION_FLAG_THRESHOLD else ""
         ])
 
-    backlog = [{**locations[i], "backlog_reason": "Capacity/time limit"} for i in range(1, len(locations)) if i not in visited]
+    backlog = [{**locations[i], "backlog_reason": "Time limit exceeded (9 hours)"} for i in range(1, len(locations)) if i not in visited]
     return routes, backlog, summary
 
-def _farthest_point_seeds(points, n_seeds, depot_lat, depot_lng):
-    if not points:
-        return []
-    seeds = [max(points, key=lambda p: haversine_km(p[0], p[1], depot_lat, depot_lng))]
-    while len(seeds) < n_seeds and len(seeds) < len(points):
-        seeds.append(max(points, key=lambda p: min(haversine_km(p[0], p[1], s[0], s[1]) for s in seeds)))
-    return seeds
 
-
-def cluster_orders_by_geography(orders, n_clusters, depot_lat, depot_lng):
+def cluster_greedy_around_oldest(orders, n_clusters, capacity_box):
     """
-    Because the incoming 'orders' array is already sorted Oldest-First in main(),
-    this guarantees older POs are processed and geographically grouped first.
+    Greedy clustering that guarantees older POs are the central anchors of every route.
+    1. Takes the absolute oldest unassigned order as the 'anchor' for Truck 1.
+    2. Sweeps up the nearest unassigned orders to that anchor until the truck hits capacity.
+    3. Repeats for Truck 2 with the next oldest unassigned order.
     """
-    if n_clusters <= 1 or not orders:
-        return [orders] + [[] for _ in range(max(0, n_clusters - 1))]
-
-    points = [(o["lat"], o["lng"]) for o in orders]
-    seeds = _farthest_point_seeds(points, n_clusters, depot_lat, depot_lng)
+    if not orders:
+        return [[] for _ in range(n_clusters)], []
+        
+    # Sort by age (descending), then box size (descending) as a tie-breaker
+    unassigned = sorted(orders, key=lambda x: (x.get("age", 0), x.get("box", 0)), reverse=True)
     clusters = [[] for _ in range(n_clusters)]
-
-    for order in orders:
-        best_i = min(
-            range(len(seeds)),
-            key=lambda i: haversine_km(order["lat"], order["lng"], seeds[i][0], seeds[i][1])
-        )
-        clusters[best_i].append(order)
-
-    return clusters
+    
+    for i in range(n_clusters):
+        if not unassigned: break
+        
+        # The absolute oldest remaining order becomes the anchor for this vehicle
+        anchor = unassigned.pop(0)
+        clusters[i].append(anchor)
+        current_load = anchor.get("box", 0)
+        
+        # Sort all remaining orders strictly by distance to this specific anchor
+        unassigned.sort(key=lambda o: haversine_km(anchor["lat"], anchor["lng"], o["lat"], o["lng"]))
+        
+        j = 0
+        while j < len(unassigned):
+            candidate = unassigned[j]
+            # Hard capacity constraint: only add to cluster if it fits
+            if current_load + candidate.get("box", 0) <= capacity_box:
+                clusters[i].append(candidate)
+                current_load += candidate.get("box", 0)
+                unassigned.pop(j) # Remove from unassigned pool
+            else:
+                # Skip it, leave it in unassigned for the next truck, and check the next closest
+                j += 1
+                
+    return clusters, unassigned
 
 
 def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
-    clusters = cluster_orders_by_geography(orders, n, depot_lat, depot_lng)
+    # Cluster orders strictly by capacity, anchored entirely around the oldest POs
+    clusters, unassigned = cluster_greedy_around_oldest(orders, n, VEHICLE_CAPACITY_BOX)
 
     all_routes, all_backlog, all_summary = [], [], []
+    
+    # Any order that didn't fit into ANY truck's greedy capacity phase is backlogged immediately
+    for o in unassigned:
+        all_backlog.append({**o, "backlog_reason": "No capacity left in any vehicle zone"})
+        
     for cluster_idx, cluster_orders in enumerate(clusters):
         if cluster_idx >= NUM_VEHICLES:
-            all_backlog.extend([{**o, "backlog_reason": "No vehicle available for this cluster"} for o in cluster_orders])
             continue
 
         vehicle = VEHICLES[cluster_idx]
@@ -555,6 +561,8 @@ def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
         cluster_locations = [{"lat": depot_lat, "lng": depot_lng}] + cluster_orders
         sub_dist, sub_time = build_distance_time_matrices(cluster_locations)
 
+        # OR-Tools now receives a perfectly sized cluster. It only needs to worry 
+        # about TSP distance optimization and the 9-hour time limit.
         routes, backlog, summary = solve_routing(cluster_orders, route_date, 1, sub_dist, sub_time)
 
         for r in routes:
@@ -577,17 +585,16 @@ def solve_all_scenarios(orders, route_date):
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
-            if n == 1:
-                locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + orders
-                dist_km, time_min = build_distance_time_matrices(locations)
-                r, b, s = solve_routing(orders, route_date, 1, dist_km, time_min)
-            else:
-                r, b, s = solve_clustered_scenario(orders, route_date, n, DEPOT_LAT, DEPOT_LNG)
+            # Re-routed the 1-vehicle scenario to use the same logic as multi-vehicle, 
+            # ensuring it correctly caps at 1200 boxes around the oldest PO 
+            # instead of crashing OSRM by sending all orders.
+            r, b, s = solve_clustered_scenario(orders, route_date, n, DEPOT_LAT, DEPOT_LNG)
             print(f"  Served {sum(row[2] for row in s)}/{len(orders)}, backlog {len(b)}, dist {sum(row[4] for row in s):.1f}km")
             scenarios[n] = {"routes": r, "backlog": b, "summary": s}
         except Exception as e:
             scenarios[n] = {"error": str(e)}
     return scenarios
+
 
 def main():
     route_date_str = os.environ.get("ROUTE_DATE", "").strip()
@@ -598,17 +605,13 @@ def main():
     orders = load_orders(spreadsheet)
     if not orders: return print("No orders to route.")
 
-    # 1. Pre-calculate age for every order globally
     for o in orders:
         order_date = parse_date_flexible(o.get("tanggal_masuk"))
         o["age"] = max(0, (route_date - order_date).days) if order_date else 0
-        
-    # 2. Sort the entire batch Oldest First. Because of this sort, older POs 
-    # run through the clustering engine and routing matrix ahead of newer ones.
-    orders.sort(key=lambda x: x["age"], reverse=True)
 
     scenarios = solve_all_scenarios(orders, route_date)
     write_routing_output(spreadsheet, route_date.strftime("%d/%m/%Y"), scenarios)
+
 
 if __name__ == "__main__":
     main()
