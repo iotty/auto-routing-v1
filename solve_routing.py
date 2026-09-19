@@ -2,9 +2,8 @@
 Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
-3 vehicles subject to capacity/time constraints, and writes the
-plan to Google Sheets. Backlogs older orders last, utilizing strict 
-geographic clustering for clean route territories.
+3 vehicles subject to 9-hour time limits, and writes the plan to Google Sheets. 
+Sorts and clusters older orders first to guarantee strict priority routing.
 """
 
 import os
@@ -44,7 +43,10 @@ VEHICLES = [
 NUM_VEHICLES = len(VEHICLES)
 
 VEHICLE_CAPACITY_BOX = int(_env_num("VEHICLE_CAPACITY_BOX", 1200))
-SHIFT_LENGTH_MINUTES = int(_env_num("SHIFT_LENGTH_MINUTES", 600))
+
+# Reduced to 9 hours (540 minutes) per user request
+SHIFT_LENGTH_MINUTES = int(_env_num("SHIFT_LENGTH_MINUTES", 540))
+
 SERVICE_TIME_BASE_MINUTES = int(_env_num("SERVICE_TIME_MINUTES", 15))
 SERVICE_TIME_FREE_BOX_THRESHOLD = int(_env_num("SERVICE_TIME_FREE_BOX_THRESHOLD", 6))
 SERVICE_TIME_PER_EXTRA_BOX_MINUTES = _env_num("SERVICE_TIME_PER_EXTRA_BOX_MINUTES", 1)
@@ -60,12 +62,11 @@ UTILIZATION_FLAG_THRESHOLD = 22
 SHIFT_START_HOUR = 6
 AVG_SPEED_KMH_FALLBACK = 25
 
-# Base penalty prevents dropping new orders to save distance.
-# Changed from Exponential to Additive/Linear to preserve geographic density!
-# E.g., Age 0 = 50k, Age 1 = 65k. Dropping two Age 0 orders (100k) is now WORSE 
-# than dropping one Age 1 order (65k), forcing the solver to clean dense areas.
-PRIORITY_BASE_PENALTY = int(_env_num("PRIORITY_BASE_PENALTY", 50_000))
-PRIORITY_AGE_BONUS = int(_env_num("PRIORITY_AGE_BONUS", 15_000))
+# Age bonus is now 10x the base penalty. This guarantees the solver will sweep 
+# the newest orders out of the route to make room for older POs, ensuring 
+# the oldest POs form the guaranteed core of every geographic cluster.
+PRIORITY_BASE_PENALTY = int(_env_num("PRIORITY_BASE_PENALTY", 10_000))
+PRIORITY_AGE_BONUS = int(_env_num("PRIORITY_AGE_BONUS", 100_000))
 
 SOLVE_TIME_LIMIT_SECONDS = 15
 
@@ -176,21 +177,22 @@ def write_routing_output(spreadsheet, route_date, scenarios):
             "Box (this stop)", "Cumulative Box", "ETA", "ETD",
             "Distance from Prev (km)", "Tanggal Fulfillment Masuk FF",
             "Nomor AWB", "Jam Fulfillment Masuk FF", "Jumlah BKU",
+            "Age (Days)",  # Added Age column to output for visibility
         ], [
             [route_date, r["vehicle"], r["driver"], r["nopol"], r["seq"], r["kode_fulfillment"],
              r["nama_penerima"], r["alamat_penerima"], r["kabupaten_kota"], r["lat"], r["lng"],
              r["box"], r["cumulative_box"], r["eta"], r["etd"],
              round(r["distance_from_prev_km"], 2), r["tanggal_masuk"],
-             r["nomor_awb"], r["jam_masuk"], r["jumlah_bku"]]
+             r["nomor_awb"], r["jam_masuk"], r["jumlah_bku"], r.get("age", 0)]
             for r in result["routes"]
         ], route_date)
 
         _upsert_sheet_by_date(spreadsheet, backlog_sheet, [
             "Route Date", "Kode Fulfillment", "Nama Penerima", "Alamat Penerima",
-            "Latitude", "Longitude", "Box", "Tanggal Fulfillment Masuk FF", "Reason",
+            "Latitude", "Longitude", "Box", "Tanggal Fulfillment Masuk FF", "Age (Days)", "Reason",
         ], [
             [route_date, b["kode_fulfillment"], b["nama_penerima"], b["alamat_penerima"],
-             b["lat"], b["lng"], b["box"], b["tanggal_masuk"], b.get("backlog_reason", "Backlogged")]
+             b["lat"], b["lng"], b["box"], b["tanggal_masuk"], b.get("age", 0), b.get("backlog_reason", "Backlogged")]
             for b in result["backlog"]
         ], route_date)
 
@@ -440,10 +442,11 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     time_dim = routing.GetDimensionOrDie("Time")
 
     for idx in range(1, len(locations)):
-        order_date = parse_date_flexible(locations[idx].get("tanggal_masuk"))
-        age = max(0, (route_date - order_date).days) if order_date else 0
+        # Retrieve the age that was pre-calculated and sorted in main()
+        age = locations[idx].get("age", 0)
         
-        # Linear age penalty: respects older POs, but refuses to ruin route density
+        # Massive age bonus guarantees the solver forces older POs into the route, 
+        # dropping brand new geographic outliers instead.
         safe_age = min(age, 10)
         penalty = int(PRIORITY_BASE_PENALTY + (PRIORITY_AGE_BONUS * safe_age))
         
@@ -487,6 +490,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
                     "kabupaten_kota": locations[node].get("kabupaten_kota", ""),
                     "jam_masuk": locations[node].get("jam_masuk", ""),
                     "jumlah_bku": locations[node].get("jumlah_bku", locations[node].get("box", 0)),
+                    "age": locations[node].get("age", 0),
                 })
                 prev = node
             idx = solution.Value(routing.NextVar(idx))
@@ -514,11 +518,8 @@ def _farthest_point_seeds(points, n_seeds, depot_lat, depot_lng):
 
 def cluster_orders_by_geography(orders, n_clusters, depot_lat, depot_lng):
     """
-    Groups orders into STRICT geographic zones based on nearest seed.
-    Unlike capacity-constrained clustering, this allows a cluster to exceed 
-    vehicle capacity during assignment. The OR-Tools solver will then optimally 
-    select the densest core of orders to serve today and push the geographic 
-    outliers to the backlog, resulting in clean, non-overlapping territories.
+    Because the incoming 'orders' array is already sorted Oldest-First in main(),
+    this guarantees older POs are processed and geographically grouped first.
     """
     if n_clusters <= 1 or not orders:
         return [orders] + [[] for _ in range(max(0, n_clusters - 1))]
@@ -528,7 +529,6 @@ def cluster_orders_by_geography(orders, n_clusters, depot_lat, depot_lng):
     clusters = [[] for _ in range(n_clusters)]
 
     for order in orders:
-        # Strictly assign to the absolute nearest seed. No capacity check here.
         best_i = min(
             range(len(seeds)),
             key=lambda i: haversine_km(order["lat"], order["lng"], seeds[i][0], seeds[i][1])
@@ -539,7 +539,6 @@ def cluster_orders_by_geography(orders, n_clusters, depot_lat, depot_lng):
 
 
 def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
-    # Changed from capacity-based to strict geography-based clustering
     clusters = cluster_orders_by_geography(orders, n, depot_lat, depot_lng)
 
     all_routes, all_backlog, all_summary = [], [], []
@@ -598,6 +597,15 @@ def main():
     spreadsheet = get_spreadsheet()
     orders = load_orders(spreadsheet)
     if not orders: return print("No orders to route.")
+
+    # 1. Pre-calculate age for every order globally
+    for o in orders:
+        order_date = parse_date_flexible(o.get("tanggal_masuk"))
+        o["age"] = max(0, (route_date - order_date).days) if order_date else 0
+        
+    # 2. Sort the entire batch Oldest First. Because of this sort, older POs 
+    # run through the clustering engine and routing matrix ahead of newer ones.
+    orders.sort(key=lambda x: x["age"], reverse=True)
 
     scenarios = solve_all_scenarios(orders, route_date)
     write_routing_output(spreadsheet, route_date.strftime("%d/%m/%Y"), scenarios)
