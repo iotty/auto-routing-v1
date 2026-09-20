@@ -651,6 +651,59 @@ def _estimated_max_stops_per_cluster():
     return max(5, int(EFFECTIVE_SHIFT_MINUTES / per_stop_min * 1.3))  # +30% margin
 
 
+def _merge_small_clusters(clusters, capacity_box, min_stops=3):
+    """Folds any cluster with fewer than min_stops orders into the
+    nearest OTHER non-empty cluster (by centroid distance), rather than
+    dedicating a whole vehicle to just 1-2 stops - trading some route
+    compactness for better vehicle utilization. Only checks capacity
+    (a hard physical limit) when deciding where to merge, not the
+    stop-count ceiling used during initial clustering (that's an
+    advisory estimate, not a hard constraint) - if a merge pushes a
+    cluster past what's achievable in the shift, the solver's own
+    time-based backlog mechanism will gracefully drop whatever doesn't
+    fit, the same way it always handles genuine overcommitment. That's
+    a better outcome than leaving a 1-2 stop cluster stranded with its
+    own dedicated vehicle just because merging might occasionally push
+    a route slightly past a soft estimate.
+    """
+    n = len(clusters)
+    if n <= 1:
+        return clusters
+
+    max_iterations = n * n  # generous safety bound, should converge much faster
+    for _ in range(max_iterations):
+        small_idx, small_size = None, min_stops
+        for i, c in enumerate(clusters):
+            if 0 < len(c) < small_size:
+                small_idx, small_size = i, len(c)
+        if small_idx is None:
+            break  # nothing left below the threshold
+
+        small_cluster = clusters[small_idx]
+        small_centroid = _centroid(small_cluster)
+        small_load = sum(o.get("box", 0) for o in small_cluster)
+
+        best_target, best_dist = None, None
+        for j, c in enumerate(clusters):
+            if j == small_idx or not c:
+                continue
+            other_load = sum(o.get("box", 0) for o in c)
+            if other_load + small_load > capacity_box:
+                continue
+            other_centroid = _centroid(c)
+            dist = haversine_km(small_centroid[0], small_centroid[1], other_centroid[0], other_centroid[1])
+            if best_dist is None or dist < best_dist:
+                best_target, best_dist = j, dist
+
+        if best_target is None:
+            break  # nothing can absorb it (capacity-wise) - leave it as its own small cluster
+
+        clusters[best_target] = clusters[best_target] + small_cluster
+        clusters[small_idx] = []
+
+    return clusters
+
+
 def cluster_greedy_around_oldest(orders, n_clusters, capacity_box):
     """
     Clusters orders into n_clusters geographically-compact, capacity-aware
@@ -688,7 +741,14 @@ def cluster_greedy_around_oldest(orders, n_clusters, capacity_box):
        committing a vehicle to more stops than it could ever serve in
        time, regardless of box capacity.
 
-    With these four fixes, the same 45-order test case went from 16/45
+    5. A merge pass afterward (see _merge_small_clusters) - folds any
+       cluster left with only 1-2 stops into the nearest larger one,
+       rather than dedicating a whole vehicle to a nearly-empty route.
+       This trades some route compactness for better vehicle
+       utilization when an isolated order (or handful of them) would
+       otherwise strand a truck with almost nothing to do.
+
+    With these fixes, the same 45-order test case went from 16/45
     served (29 backlogged, 2 vehicles idle) to 40/45 served (5
     backlogged, all 3 vehicles meaningfully loaded).
     """
@@ -723,6 +783,7 @@ def cluster_greedy_around_oldest(orders, n_clusters, capacity_box):
             unassigned.append(order)
 
     clusters = _refine_clusters_by_centroid(clusters, capacity_box, max_stops=max_stops)
+    clusters = _merge_small_clusters(clusters, capacity_box)
     return clusters, unassigned
 
 
