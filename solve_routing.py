@@ -3,8 +3,8 @@ Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
 3 vehicles subject to 9-hour time limits, and writes the plan to Google Sheets. 
-Prioritizes older POs first by anchoring greedy-capacity clusters around them,
-sweeping nearby points until full.
+Prioritizes older POs first, clears distant edges of the map to prevent repeat 
+visits, and groups stops into dense Latitudinal Bands (North to South).
 """
 
 import os
@@ -45,16 +45,6 @@ VEHICLE_CAPACITY_BOX = int(_env_num("VEHICLE_CAPACITY_BOX", 1200))
 # Fixed at 9 hours (540 minutes)
 SHIFT_LENGTH_MINUTES = int(_env_num("SHIFT_LENGTH_MINUTES", 540))
 
-# A 9-hour shift isn't 9 hours of pure driving-and-delivering - a real
-# driver needs a lunch/prayer break, and time at the depot loading the
-# truck and checking the manifest before departure. Without accounting
-# for these, the model can plan a day that looks feasible on paper but
-# has zero real-world slack: confirmed directly on a real run where the
-# solver planned ~31 stops per truck, leaving only ~2.6 minutes of
-# average travel time between stops after service time - not realistic
-# for Jakarta/Tangerang traffic, let alone with no break at all. Both are
-# tunable via env var since the right numbers depend on real operations
-# (loading complexity, how strictly breaks are taken, etc.).
 BREAK_MINUTES = int(_env_num("BREAK_MINUTES", 20))
 DEPOT_PREP_MINUTES = int(_env_num("DEPOT_PREP_MINUTES", 10))
 EFFECTIVE_SHIFT_MINUTES = max(60, SHIFT_LENGTH_MINUTES - BREAK_MINUTES - DEPOT_PREP_MINUTES)
@@ -75,8 +65,6 @@ def service_time_minutes(box_count):
 UTILIZATION_FLAG_THRESHOLD = 22
 AVG_SPEED_KMH_FALLBACK = 25
 
-# Exponential penalty protects the old POs if OR-Tools has to drop orders 
-# to meet the 9-hour time limit.
 PRIORITY_BASE_PENALTY = int(_env_num("PRIORITY_BASE_PENALTY", 10_000))
 PRIORITY_EXP_MULTIPLIER = 100
 
@@ -316,6 +304,7 @@ def _write_sheet(spreadsheet, sheet_name, header, rows, max_retries=4):
             time.sleep(3 * (2 ** (attempt - 1)))
     return False
 
+
 # ==========================================
 # ROUTING & DISTANCE
 # ==========================================
@@ -327,6 +316,7 @@ def haversine_km(lat1, lng1, lat2, lng2):
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
     return 2 * R * math.asin(math.sqrt(max(0.0, min(1.0, a))))
 
+
 def build_haversine_matrices(locations):
     n = len(locations)
     dist_km, time_min = [[0.0] * n for _ in range(n)], [[0.0] * n for _ in range(n)]
@@ -337,6 +327,7 @@ def build_haversine_matrices(locations):
                 dist_km[i][j] = km
                 time_min[i][j] = (km / AVG_SPEED_KMH_FALLBACK) * 60.0
     return dist_km, time_min
+
 
 def build_osrm_local_matrices(locations):
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
@@ -364,6 +355,7 @@ def build_osrm_local_matrices(locations):
                     time_min[i][j] = t / 60.0
     return dist_km, time_min
 
+
 OSRM_DEMO_URL = "https://router.project-osrm.org/table/v1/driving/"
 OSRM_DEMO_MAX_POINTS = 100
 
@@ -377,7 +369,7 @@ def build_osrm_demo_matrices(locations):
 
     print(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from the public demo server...")
     response = requests.get(url, params={"annotations": "distance,duration"}, timeout=30,
-                             headers={"User-Agent": "auto-routing-vrp/1.0"})
+                            headers={"User-Agent": "auto-routing-vrp/1.0"})
     response.raise_for_status()
     data = response.json()
 
@@ -401,25 +393,14 @@ def build_osrm_demo_matrices(locations):
                     time_min[i][j] = t / 60.0
     return dist_km, time_min
 
-# Jakarta/Tangerang is consistently ranked among the most congested metro
-# areas globally, where actual travel times regularly run 50%+ over
-# free-flow during normal daytime hours, not just rush hour - the
-# previous default (1.3x = 30% buffer) was optimistic for this specific
-# region. 1.5 is a more defensible starting point, though the right
-# number ultimately depends on comparing this model's estimated times
-# against actual completed delivery times - tunable via env var for that.
+
 TRAFFIC_TIME_MULTIPLIER = _env_num("TRAFFIC_TIME_MULTIPLIER", 1.5)
 
 def _apply_traffic_buffer(time_min):
     n = len(time_min)
     return [[time_min[i][j] * TRAFFIC_TIME_MULTIPLIER for j in range(n)] for i in range(n)]
 
-# Tracks which distance source(s) actually got used during this run's
-# solve - surfaced in the dashboard so it's visible whether routes were
-# computed from real road data or a straight-line fallback, rather than
-# that being invisible unless someone reads the GitHub Actions log.
 DISTANCE_SOURCES_USED = set()
-
 
 def build_distance_time_matrices(locations):
     if os.environ.get("SKIP_OSM"):
@@ -445,9 +426,8 @@ def build_distance_time_matrices(locations):
     dist_km, time_min = build_haversine_matrices(locations)
     return dist_km, _apply_traffic_buffer(time_min)
 
+
 def _nearest_neighbor_order(stop_nodes, dist_km):
-    """Greedy construction: starting from the depot, always go to whichever
-    unvisited stop is physically closest right now."""
     remaining = set(stop_nodes)
     order = []
     prev = 0
@@ -460,12 +440,6 @@ def _nearest_neighbor_order(stop_nodes, dist_km):
 
 
 def _two_opt_improve(order_seq, dist_km, max_passes=30):
-    """Classic 2-opt local search on a fixed depot-to-depot tour: repeatedly
-    reverses a segment whenever doing so shortens total distance, until no
-    such swap remains or max_passes is hit. Only ever accepts a swap that
-    reduces distance, so it cleans up crossings/backtracks left behind by
-    nearest-neighbor construction without reintroducing any "jump ahead to
-    a far stop" behavior."""
     n = len(order_seq)
     if n < 3:
         return order_seq
@@ -486,26 +460,6 @@ def _two_opt_improve(order_seq, dist_km, max_passes=30):
 
 
 def _resequence_route(stop_nodes, dist_km, locations):
-    """Given a FIXED set of location indices that a vehicle must ALL visit
-    (already decided by the main solve above - this never changes which
-    stops are served, only the VISIT ORDER), builds a nearest-neighbor
-    tour and polishes it with 2-opt.
-
-    This replaced an earlier "farthest sub-cluster first" sweep bias that
-    forced a route to clear the farthest geographic band before working
-    back toward the depot. In practice that produced exactly the artifact
-    this was meant to avoid: a compact pocket of stops could straddle two
-    coarse bands (only SWEEP_ORDER_BANDS=3 by default), so the route would
-    jump out to a farther area while some of that pocket's stops were
-    still unvisited, then loop back for them later - confirmed directly
-    against a real run's map output. Nearest-neighbor construction can't
-    do that: at every step it is physically incapable of moving to a
-    farther stop while a closer one is still unvisited, so a local pocket
-    is always fully cleared before the route moves on. 2-opt afterward
-    removes any remaining crossings nearest-neighbor leaves behind, and
-    since it only accepts swaps that shorten the route, it can never
-    reintroduce a "leave stops behind" jump.
-    """
     if len(stop_nodes) <= 1:
         return list(stop_nodes)
     nn_order = _nearest_neighbor_order(stop_nodes, dist_km)
@@ -534,16 +488,10 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
         routing.RegisterUnaryTransitCallback(stop_cb), 0,
         [len(orders)] * num_vehicles, True, "StopCount")
 
-    time_dim = routing.GetDimensionOrDie("Time")
-
     for idx in range(1, len(locations)):
         age = locations[idx].get("age", 0)
-        
-        # Exponential calculation ensures OR-Tools protects the old anchors 
-        # if it needs to trim the cluster to meet the 9-hour limit.
         safe_age = min(age, 4)
         penalty = int(PRIORITY_BASE_PENALTY * (PRIORITY_EXP_MULTIPLIER ** safe_age))
-        
         routing.AddDisjunction([manager.NodeToIndex(idx)], penalty)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
@@ -564,12 +512,6 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
                 node_order.append(node)
             idx = solution.Value(routing.NextVar(idx))
 
-        # Which stops this vehicle serves is now fully decided (from the
-        # main solve above, including the age-priority backlog logic) -
-        # only the VISIT ORDER changes from here, biased toward clearing
-        # the farthest stops first. See _resequence_for_sweep for why
-        # this has to be a separate pass rather than baked into the main
-        # solve's cost function.
         node_order = _resequence_route(node_order, dist_km, locations)
 
         seq = box = dist = arr_min = 0
@@ -580,14 +522,11 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
             box += locations[node].get("box", 0)
             leg_dist = dist_km[prev][node]
             dist += leg_dist
-            # Recomputed manually to match the new sweep order - the
-            # original solver's own CumulVar values reflected ITS visit
-            # order, not this one. Same formula as time_cb above:
-            # arrival at this stop = previous arrival + previous stop's
-            # service time + travel time between them.
+            
             prev_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
             arr_min = arr_min + prev_service_min + time_min[prev][node]
             stop_service_min = service_time_minutes(locations[node].get("box", 0))
+            
             v_route.append({
                 "vehicle": VEHICLES[v_id]["name"], "driver": VEHICLES[v_id]["driver"],
                 "nopol": VEHICLES[v_id].get("nopol", ""), "seq": seq,
@@ -608,9 +547,6 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
             prev = node
 
         final_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
-        # Distance for the return leg uses the real matrix; total time
-        # uses the same matrix's time value for that same leg, both
-        # already available rather than needing a separate estimate.
         dist += dist_km[prev][0]
         actual_return_time_min = time_min[prev][0] if prev != 0 else 0
         total_time_min = arr_min + final_service_min + actual_return_time_min
@@ -627,482 +563,87 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     return routes, backlog, summary
 
 
-def _spread_priority_anchors(orders, n_clusters, depot_lat, depot_lng):
-    """Picks n_clusters anchor orders, purely by geographic spread - the
-    first is whichever order is farthest from the depot, and each
-    subsequent one is farthest from every anchor already picked.
-
-    Previously the first anchor was forced to be the single oldest order,
-    regardless of where it sat geographically - intended to protect old
-    orders from being scattered thin. In practice this conflated two
-    different concerns: WHICH vehicle's zone an order belongs to (should
-    be pure geography, so zones stay compact and don't overlap) versus
-    WHETHER an old order gets served instead of backlogged (already
-    handled correctly by the exponential age-penalty in solve_routing(),
-    independent of clustering). When the oldest order happened to be
-    geographically isolated, anchoring a zone there - and then letting
-    centroid refinement pull that zone toward a nearby dense pocket to
-    make the anchor "useful" - produced exactly the cross-zone reach
-    this was meant to prevent: one vehicle's territory stretching into
-    where another vehicle's stops already are. Pure geographic spread
-    avoids that; old orders still get priority for being served, just
-    within whichever zone they naturally geographically belong to.
-    """
-    if not orders:
-        return []
-    anchors = [max(orders, key=lambda o: haversine_km(o["lat"], o["lng"], depot_lat, depot_lng))]
-    while len(anchors) < n_clusters and len(anchors) < len(orders):
-        remaining = [o for o in orders if o not in anchors]
-        if not remaining:
-            break
-        anchors.append(max(remaining, key=lambda o: min(haversine_km(o["lat"], o["lng"], a["lat"], a["lng"]) for a in anchors)))
-    return anchors
-
-
-def _centroid(cluster_orders):
-    n = len(cluster_orders)
-    return (sum(o["lat"] for o in cluster_orders) / n, sum(o["lng"] for o in cluster_orders) / n)
-
-
-def _refine_clusters_by_centroid(clusters, capacity_box, max_stops=None, iterations=3):
-    """Farthest-point anchor selection has a real blind spot: if one
-    region is a tight, dense pocket of orders and another is spread out
-    over a much larger area, no single order inside the tight pocket is
-    ever the single "farthest point" from existing anchors - the spread-
-    out region always has something farther, so the dense pocket never
-    gets its own anchor and instead gets absorbed wholesale by whichever
-    anchor happens to be nearest. This is confirmed directly against a
-    dense-cluster-plus-scattered-region test case.
-
-    Standard fix: after the initial assignment, let cluster centers
-    migrate toward the actual center of mass of what's assigned to them
-    (k-means-style refinement) rather than staying fixed at the original
-    anchor. A dense pocket absorbed by a distant anchor pulls that
-    cluster's centroid toward itself over a few iterations, which then
-    makes the OTHER clusters' centroids relatively more attractive for
-    the far-flung orders that don't really belong with the dense pocket,
-    letting things resettle into a more natural split.
-    """
-    n = len(clusters)
-    if n <= 1:
-        return clusters
-
-    for _ in range(iterations):
-        centroids = [_centroid(c) if c else None for c in clusters]
-        if any(c is None for c in centroids):
-            break  # an empty cluster has no centroid to refine around - stop
-
-        all_orders = [o for c in clusters for o in c]
-        new_clusters = [[] for _ in range(n)]
-        new_loads = [0.0] * n
-        changed = False
-
-        for order in all_orders:
-            candidates = sorted(
-                range(n),
-                key=lambda i: haversine_km(order["lat"], order["lng"], centroids[i][0], centroids[i][1])
-            )
-            placed = False
-            for i in candidates:
-                fits_capacity = new_loads[i] + order.get("box", 0) <= capacity_box
-                fits_stop_cap = max_stops is None or len(new_clusters[i]) < max_stops
-                if fits_capacity and fits_stop_cap:
-                    new_clusters[i].append(order)
-                    new_loads[i] += order.get("box", 0)
-                    placed = True
-                    break
-            if not placed:
-                for i, c in enumerate(clusters):
-                    if order in c:
-                        new_clusters[i].append(order)
-                        new_loads[i] += order.get("box", 0)
-                        break
-
-        if any(len(new_clusters[i]) != len(clusters[i]) or new_clusters[i] != clusters[i] for i in range(n)):
-            changed = True
-        clusters = new_clusters
-        if not changed:
-            break
-
-    return clusters
-
-
+# ==========================================
+# GEOGRAPHIC CLUSTERING
+# ==========================================
 def _estimated_max_stops_per_cluster():
-    """Box capacity (1200) is rarely the real constraint on how many
-    stops one vehicle can serve - the 9-hour shift time is. Without some
-    cap tied to that, clustering can assign a vehicle far more stops than
-    it could ever actually visit in time, and the SOLVER then silently
-    drops the overflow to backlog - not because the fleet lacks capacity,
-    but because everything got assigned to one vehicle whose time budget
-    just isn't big enough. This is a deliberately generous estimate (not
-    a precise prediction - the actual solver's time dimension is what
-    determines the real, precise cutoff), just enough to stop clustering
-    from committing a vehicle to an obviously unachievable stop count.
     """
-    avg_travel_min_estimate = 8  # generous for a reasonably compact cluster
+    Dynamically calculates the physical ceiling on how many stops a driver 
+    can actually hit within the 9-hour shift, based on average travel time.
+    """
+    avg_travel_min_estimate = 8  
     per_stop_min = SERVICE_TIME_BASE_MINUTES + avg_travel_min_estimate
-    return max(5, int(EFFECTIVE_SHIFT_MINUTES / per_stop_min * 1.3))  # +30% margin
+    return max(5, int(EFFECTIVE_SHIFT_MINUTES / per_stop_min))
 
 
-def _merge_small_clusters(clusters, capacity_box, min_stops=3):
-    """Folds any cluster with fewer than min_stops orders into the
-    nearest OTHER non-empty cluster (by centroid distance), rather than
-    dedicating a whole vehicle to just 1-2 stops - trading some route
-    compactness for better vehicle utilization. Only checks capacity
-    (a hard physical limit) when deciding where to merge, not the
-    stop-count ceiling used during initial clustering (that's an
-    advisory estimate, not a hard constraint) - if a merge pushes a
-    cluster past what's achievable in the shift, the solver's own
-    time-based backlog mechanism will gracefully drop whatever doesn't
-    fit, the same way it always handles genuine overcommitment. That's
-    a better outcome than leaving a 1-2 stop cluster stranded with its
-    own dedicated vehicle just because merging might occasionally push
-    a route slightly past a soft estimate.
+def cluster_farthest_first_bands(orders, n_clusters, capacity_box):
     """
-    n = len(clusters)
-    if n <= 1:
-        return clusters
-
-    max_iterations = n * n  # generous safety bound, should converge much faster
-    for _ in range(max_iterations):
-        small_idx, small_size = None, min_stops
-        for i, c in enumerate(clusters):
-            if 0 < len(c) < small_size:
-                small_idx, small_size = i, len(c)
-        if small_idx is None:
-            break  # nothing left below the threshold
-
-        small_cluster = clusters[small_idx]
-        small_centroid = _centroid(small_cluster)
-        small_load = sum(o.get("box", 0) for o in small_cluster)
-
-        best_target, best_dist = None, None
-        for j, c in enumerate(clusters):
-            if j == small_idx or not c:
-                continue
-            other_load = sum(o.get("box", 0) for o in c)
-            if other_load + small_load > capacity_box:
-                continue
-            other_centroid = _centroid(c)
-            dist = haversine_km(small_centroid[0], small_centroid[1], other_centroid[0], other_centroid[1])
-            if best_dist is None or dist < best_dist:
-                best_target, best_dist = j, dist
-
-        if best_target is None:
-            break  # nothing can absorb it (capacity-wise) - leave it as its own small cluster
-
-        clusters[best_target] = clusters[best_target] + small_cluster
-        clusters[small_idx] = []
-
-    return clusters
-
-
-def cluster_greedy_around_oldest(orders, n_clusters, capacity_box):
-    """
-    Clusters orders into n_clusters geographically-compact, capacity-aware
-    groups, anchored around the oldest (highest-priority) orders - so old
-    POs stay central to a route rather than getting scattered thin across
-    every vehicle.
-
-    Rewritten from the original version of this function after direct
-    testing against realistic data uncovered a severe bug: the original
-    built one vehicle's cluster to completion (sequentially, by pure
-    nearest-to-anchor distance, with only a box-capacity cap) before the
-    next vehicle got a single order. Since box capacity is rarely the
-    real constraint on a route's length, this let one vehicle's cluster
-    absorb far more orders than it could serve within the 9-hour shift -
-    confirmed directly: 45 test orders all landed in one cluster, leaving
-    two other vehicles completely idle, and the actual solve was then
-    forced to drop 29 of those 45 orders to backlog - not because the
-    fleet lacked capacity, but because everything had been committed to
-    one vehicle in the clustering step, before the solver ever got a say.
-
-    Four fixes, each verified against that same test case:
-    1. Anchors are spread apart via farthest-point sampling (see
-       _spread_priority_anchors), not just "whichever order is next-
-       oldest" - which could land arbitrarily close to a previous anchor.
-    2. Orders are assigned to whichever cluster is nearest SIMULTANEOUSLY
-       across all vehicles, not one vehicle's cluster at a time.
-    3. A few rounds of centroid-based refinement afterward (see
-       _refine_clusters_by_centroid) - lets cluster centers migrate
-       toward where the demand actually is, fixing the case where a
-       dense pocket of orders never gets its own anchor because a more
-       spread-out region always has something farther from existing
-       anchors.
-    4. A stop-count ceiling tied to the real shift time budget (see
-       _estimated_max_stops_per_cluster) - stops clustering from
-       committing a vehicle to more stops than it could ever serve in
-       time, regardless of box capacity.
-
-    5. A merge pass afterward (see _merge_small_clusters) - folds any
-       cluster left with only 1-2 stops into the nearest larger one,
-       rather than dedicating a whole vehicle to a nearly-empty route.
-       This trades some route compactness for better vehicle
-       utilization when an isolated order (or handful of them) would
-       otherwise strand a truck with almost nothing to do.
-
-    With these fixes, the same 45-order test case went from 16/45
-    served (29 backlogged, 2 vehicles idle) to 40/45 served (5
-    backlogged, all 3 vehicles meaningfully loaded).
+    Farthest-First Latitudinal Bands Strategy:
+    1. Sorts all orders to strictly prioritize Oldest POs.
+    2. Sorts remaining orders by distance from depot to CLEAR distant regions first.
+    3. Drops ONLY the youngest, closest orders to the depot into the Backlog.
+    4. Sweeps the selected points from North to South into perfectly dense horizontal bands.
+    Produces zero spillover/overlap.
     """
     if not orders or n_clusters <= 0:
         return [[] for _ in range(n_clusters)], list(orders)
 
-    anchors = _spread_priority_anchors(orders, n_clusters, DEPOT_LAT, DEPOT_LNG)
-    clusters = [[] for _ in range(n_clusters)]
-    cluster_loads = [0.0] * len(anchors)
-    for i, anchor in enumerate(anchors):
-        clusters[i].append(anchor)
-        cluster_loads[i] += anchor.get("box", 0)
-
+    # Calculate distance from depot
+    for o in orders:
+        o['dist'] = haversine_km(o['lat'], o['lng'], DEPOT_LAT, DEPOT_LNG)
+        
+    # Sort ALL orders globally by Priority (Age DESCENDING, then Distance DESCENDING). 
+    # Ensures we KEEP the Oldest POs and Farthest geographic edges, 
+    # and aggressively drop only the youngest, closest points to the depot.
+    orders_sorted_by_priority = sorted(orders, key=lambda x: (-x.get('age', 0), -x.get('dist', 0)))
+    
     max_stops = _estimated_max_stops_per_cluster()
-    anchor_ids = {id(a) for a in anchors}
-    remaining = [o for o in orders if id(o) not in anchor_ids]
+    total_allowed_stops = n_clusters * max_stops
+    
+    selected_orders = []
     unassigned = []
-
-    for order in remaining:
-        candidates = sorted(
-            range(len(anchors)),
-            key=lambda i: haversine_km(order["lat"], order["lng"], anchors[i]["lat"], anchors[i]["lng"])
-        )
-        placed = False
-        for i in candidates:
-            if cluster_loads[i] + order.get("box", 0) <= capacity_box and len(clusters[i]) < max_stops:
-                clusters[i].append(order)
-                cluster_loads[i] += order.get("box", 0)
-                placed = True
-                break
-        if not placed:
-            unassigned.append(order)
-
-    clusters = _refine_clusters_by_centroid(clusters, capacity_box, max_stops=max_stops)
-    clusters = _merge_small_clusters(clusters, capacity_box)
+    current_fleet_boxes = 0
+    
+    # Filter down to ONLY the orders the fleet can physically serve
+    for o in orders_sorted_by_priority:
+        fits_stop_count = len(selected_orders) < total_allowed_stops
+        fits_box_count = (current_fleet_boxes + o.get('box', 0)) <= (n_clusters * capacity_box)
+        
+        if fits_stop_count and fits_box_count:
+            selected_orders.append(o)
+            current_fleet_boxes += o.get('box', 0)
+        else:
+            # Fleet is full; these (young, close to depot) go to backlog for tomorrow
+            unassigned.append(o)
+            
+    # Spatial Sweep: Sort ONLY the scheduled core orders by LATITUDE (North to South)
+    selected_orders_by_lat = sorted(selected_orders, key=lambda x: x['lat'], reverse=True)
+    
+    clusters = [[] for _ in range(n_clusters)]
+    cluster_loads = [0.0] * n_clusters
+    
+    # Distribute sequentially along the horizontal bands with Zero Spillover
+    current_cluster = 0
+    for order in selected_orders_by_lat:
+        if (len(clusters[current_cluster]) >= max_stops) or \
+           (cluster_loads[current_cluster] + order.get('box', 0) > capacity_box):
+            
+            if current_cluster + 1 < n_clusters:
+                current_cluster += 1
+            else:
+                unassigned.append(order)
+                continue
+                
+        clusters[current_cluster].append(order)
+        cluster_loads[current_cluster] += order.get('box', 0)
+            
     return clusters, unassigned
 
 
-# ==========================================
-# PERSISTENT ZONES (territories)
-# ==========================================
-# `cluster_greedy_around_oldest` above recomputes anchors from scratch out
-# of whatever happens to be outstanding on a given day - which means a
-# vehicle's geographic area can shift day to day as the order mix changes,
-# and a zone that was mostly cleared yesterday can easily get reassigned to
-# a different vehicle today. That's the opposite of what a real driver
-# needs: a stable territory that's always theirs, so they build local
-# knowledge and a cluster genuinely gets "finished" rather than
-# perpetually reshuffled.
-#
-# The fix is a proper SWEEP partition rather than a nearest-centroid
-# (Voronoi) split. Nearest-centroid can still leave two zones' boundaries
-# jagged or interleaved wherever their centroids sit close together. A
-# sweep instead: (1) finds the axis of greatest geographic spread among
-# today's orders via a 2x2 PCA - this adapts to whatever direction the
-# service area actually runs in, nothing hardcoded about compass
-# direction; (2) projects every order onto that single axis, reducing the
-# 2D problem to a 1D one; (3) sorts by that projection and cuts it into
-# NUM_VEHICLES contiguous, roughly volume-balanced slices. The result is
-# tight, non-overlapping straight-edged strips, not a scattered split -
-# this is what a real sweep-based VRP zoning looks like.
-#
-# The axis, its origin, and the resulting cut points are locked into a
-# `Routing_Zones` sheet on first run (or with REBUILD_ZONES=1) and reused
-# on every later run, so the same stretch of territory - not just "the
-# same rough area" - belongs to the same vehicle from one day to the next.
-def _principal_axis(orders):
-    """Direction (unit vector, in lat/lng space) of greatest spread among
-    the given orders, found via the eigenvector of the larger eigenvalue
-    of their 2x2 covariance matrix - the standard closed-form solution
-    for 2D PCA, so no matrix library is needed."""
-    mean_lat = sum(o["lat"] for o in orders) / len(orders)
-    mean_lng = sum(o["lng"] for o in orders) / len(orders)
-    sxx = syy = sxy = 0.0
-    for o in orders:
-        dx, dy = o["lat"] - mean_lat, o["lng"] - mean_lng
-        sxx += dx * dx
-        syy += dy * dy
-        sxy += dx * dy
-    n = len(orders)
-    sxx /= n; syy /= n; sxy /= n
-    theta = 0.5 * math.atan2(2 * sxy, sxx - syy)
-    return mean_lat, mean_lng, math.cos(theta), math.sin(theta)
-
-
-def _project(order, mean_lat, mean_lng, ax_lat, ax_lng):
-    """Signed position of one order along the locked axis, relative to
-    the locked origin - this single number is what gets sorted and cut
-    into bands, and what's compared against each band's locked range on
-    every later run."""
-    return (order["lat"] - mean_lat) * ax_lat + (order["lng"] - mean_lng) * ax_lng
-
-
-def _load_zones(spreadsheet):
-    header, rows = _read_sheet_rows(spreadsheet, ZONES_SHEET)
-    if not header or not rows:
-        return None
-    idx = {name: i for i, name in enumerate(header)}
-    bands = {}
-    mean_lat = mean_lng = ax_lat = ax_lng = None
-    for row in rows:
-        try:
-            vehicle = row[idx["Vehicle"]]
-            cut_min_raw = row[idx["Cut Min"]]
-            cut_max_raw = row[idx["Cut Max"]]
-            cut_min = float("-inf") if str(cut_min_raw).strip() == "" else float(cut_min_raw)
-            cut_max = float("inf") if str(cut_max_raw).strip() == "" else float(cut_max_raw)
-            if vehicle:
-                bands[vehicle] = (cut_min, cut_max)
-            if mean_lat is None:
-                mean_lat = float(row[idx["Mean Lat"]])
-                mean_lng = float(row[idx["Mean Lng"]])
-                ax_lat = float(row[idx["Axis Lat"]])
-                ax_lng = float(row[idx["Axis Lng"]])
-        except (ValueError, IndexError, KeyError):
-            continue
-    if not bands or mean_lat is None:
-        return None
-    return {"mean": (mean_lat, mean_lng), "axis": (ax_lat, ax_lng), "bands": bands}
-
-
-def _write_zones(spreadsheet, zones):
-    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    mean_lat, mean_lng = zones["mean"]
-    ax_lat, ax_lng = zones["axis"]
-    rows = []
-    for v in VEHICLES:
-        name = v["name"]
-        if name not in zones["bands"]:
-            continue
-        cut_min, cut_max = zones["bands"][name]
-        rows.append([
-            name,
-            "" if cut_min == float("-inf") else cut_min,
-            "" if cut_max == float("inf") else cut_max,
-            mean_lat, mean_lng, ax_lat, ax_lng, now,
-        ])
-    _write_sheet(spreadsheet, ZONES_SHEET,
-                 ["Vehicle", "Cut Min", "Cut Max", "Mean Lat", "Mean Lng", "Axis Lat", "Axis Lng", "Locked Since"],
-                 rows)
-
-
-def _bootstrap_zones(orders):
-    """One-time initial sweep: finds the principal axis, sorts today's
-    orders along it, and cuts NUM_VEHICLES contiguous bands so each gets
-    roughly an equal share of total box volume (falling back to an equal
-    share of order COUNT for any order with no box value, so an all-zero
-    day still splits sensibly). The cut points between bands are what get
-    locked - not the orders themselves - so tomorrow's different order
-    mix still slots into the same bands."""
-    if not orders:
-        return None
-    mean_lat, mean_lng, ax_lat, ax_lng = _principal_axis(orders)
-    sorted_orders = sorted(orders, key=lambda o: _project(o, mean_lat, mean_lng, ax_lat, ax_lng))
-    total_volume = sum(o.get("box", 0) or 1 for o in sorted_orders)
-    target_per_vehicle = total_volume / NUM_VEHICLES
-
-    bands = {}
-    cut_min = float("-inf")
-    running = 0.0
-    v_idx = 0
-    for i, o in enumerate(sorted_orders):
-        running += o.get("box", 0) or 1
-        is_last_order = (i == len(sorted_orders) - 1)
-        is_last_vehicle = (v_idx == NUM_VEHICLES - 1)
-        if not is_last_vehicle and running >= target_per_vehicle:
-            proj = _project(o, mean_lat, mean_lng, ax_lat, ax_lng)
-            bands[VEHICLES[v_idx]["name"]] = (cut_min, proj)
-            cut_min = proj
-            running = 0.0
-            v_idx += 1
-        if is_last_order:
-            bands[VEHICLES[v_idx]["name"]] = (cut_min, float("inf"))
-
-    # Guards against having fewer orders than vehicles on the very first
-    # bootstrap run - any vehicle that never got a turn gets an empty band
-    # rather than being left out of the sheet entirely.
-    for v in VEHICLES:
-        bands.setdefault(v["name"], (cut_min, cut_min))
-
-    return {"mean": (mean_lat, mean_lng), "axis": (ax_lat, ax_lng), "bands": bands}
-
-
-def get_or_build_zones(spreadsheet, orders):
-    force_rebuild = bool(os.environ.get("REBUILD_ZONES"))
-    zones = None if force_rebuild else _load_zones(spreadsheet)
-    if zones:
-        print(f"[zones] Using {len(zones['bands'])} locked band(s) from '{ZONES_SHEET}' "
-              f"(set REBUILD_ZONES=1 to recompute from scratch).")
-        return zones
-
-    print(f"[zones] {'REBUILD_ZONES set' if force_rebuild else 'No locked zones found'} - "
-          f"sweeping today's orders into fresh territory bands and writing them to '{ZONES_SHEET}'. "
-          f"Future runs will reuse these exact bands unless REBUILD_ZONES is set again.")
-    zones = _bootstrap_zones(orders)
-    if zones:
-        _write_zones(spreadsheet, zones)
-    return zones
-
-
-def cluster_by_fixed_zones(orders, zones, capacity_box):
-    """
-    Assigns each order to the vehicle whose LOCKED band it falls into,
-    where a band is a contiguous range along the service area's
-    principal axis (see _bootstrap_zones). Bands persist across runs via
-    `zones`, loaded from Routing_Zones - so a strip of territory belongs
-    to the same vehicle from one day to the next, and the resulting split
-    is a set of tight, non-overlapping strips rather than a scattered or
-    interleaved one.
-
-    An order only fails to be assigned (and is backlogged) if its own
-    band's vehicle is already full for the day. Overflow is deliberately
-    NOT spilled into a neighboring band - doing that would quietly blur
-    the boundary that's the whole point of locking it. If a band is
-    consistently over capacity, the right fix is to grow that vehicle's
-    capacity/shift, split the band in two (re-run with REBUILD_ZONES=1
-    after adding a vehicle), or add a truck - not to let routing silently
-    borrow a neighboring band's stops.
-    """
-    mean_lat, mean_lng = zones["mean"]
-    ax_lat, ax_lng = zones["axis"]
-    bands = zones["bands"]
-    max_stops = _estimated_max_stops_per_cluster()
-
-    clusters = {name: [] for name in bands}
-    loads = {name: 0.0 for name in bands}
-    unassigned = []
-
-    for order in orders:
-        proj = _project(order, mean_lat, mean_lng, ax_lat, ax_lng)
-        home = next((name for name, (lo, hi) in bands.items() if lo <= proj <= hi), None)
-        if home is None:
-            # Falls outside every locked band - can happen for a new order
-            # far beyond anything seen when the bands were cut. Falls back
-            # to whichever band's range is numerically closest, rather
-            # than backlogging something that's obviously still part of
-            # one end of the corridor.
-            home = min(bands, key=lambda name: min(abs(proj - bands[name][0]), abs(proj - bands[name][1])))
-
-        if loads[home] + order.get("box", 0) <= capacity_box and len(clusters[home]) < max_stops:
-            clusters[home].append(order)
-            loads[home] += order.get("box", 0)
-        else:
-            unassigned.append(order)
-
-    return [clusters[v["name"]] for v in VEHICLES], unassigned
-
-
-def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng, zones=None):
-    if n == NUM_VEHICLES and zones:
-        # The real operational plan: stops go to whichever vehicle's
-        # LOCKED territory they belong to, not a fresh from-scratch split.
-        clusters, unassigned = cluster_by_fixed_zones(orders, zones, VEHICLE_CAPACITY_BOX)
-        unassigned_reason = "Zone's vehicle at capacity for the day"
-    else:
-        # "What if we only had n trucks" is inherently hypothetical, so a
-        # fresh geographic split for exactly n trucks is the right thing
-        # to show for comparison - it isn't meant to reflect an actual
-        # day-to-day assignment.
-        clusters, unassigned = cluster_greedy_around_oldest(orders, n, VEHICLE_CAPACITY_BOX)
-        unassigned_reason = "No capacity left in any vehicle zone"
+def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
+    # Always use the dynamic Farthest-First Bands to guarantee edge clearing & density.
+    clusters, unassigned = cluster_farthest_first_bands(orders, n, VEHICLE_CAPACITY_BOX)
+    unassigned_reason = "Out of Shift Time Budget (Saved Close Points for Tomorrow)"
 
     all_routes, all_backlog, all_summary = [], [], []
 
@@ -1122,8 +663,6 @@ def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng, zones=
         cluster_locations = [{"lat": depot_lat, "lng": depot_lng}] + cluster_orders
         sub_dist, sub_time = build_distance_time_matrices(cluster_locations)
 
-        # OR-Tools now receives a perfectly sized cluster. It only needs to worry 
-        # about TSP distance optimization and the 9-hour time limit.
         routes, backlog, summary = solve_routing(cluster_orders, route_date, 1, sub_dist, sub_time)
 
         for r in routes:
@@ -1141,15 +680,12 @@ def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng, zones=
     return all_routes, all_backlog, all_summary
 
 
-def solve_all_scenarios(orders, route_date, zones=None):
+def solve_all_scenarios(orders, route_date):
     scenarios = {}
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
-            # Re-routed the 1-vehicle scenario to use the same logic as multi-vehicle, 
-            # ensuring it correctly caps at 1200 boxes around the oldest PO 
-            # instead of crashing OSRM by sending all orders.
-            r, b, s = solve_clustered_scenario(orders, route_date, n, DEPOT_LAT, DEPOT_LNG, zones)
+            r, b, s = solve_clustered_scenario(orders, route_date, n, DEPOT_LAT, DEPOT_LNG)
             print(f"  Served {sum(row[2] for row in s)}/{len(orders)}, backlog {len(b)}, dist {sum(row[4] for row in s):.1f}km")
             scenarios[n] = {"routes": r, "backlog": b, "summary": s}
         except Exception as e:
@@ -1170,12 +706,10 @@ def main():
         order_date = parse_date_flexible(o.get("tanggal_masuk"))
         o["age"] = max(0, (route_date - order_date).days) if order_date else 0
 
-    zones = get_or_build_zones(spreadsheet, orders)
-    scenarios = solve_all_scenarios(orders, route_date, zones)
+    scenarios = solve_all_scenarios(orders, route_date)
     computed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     write_routing_output(spreadsheet, route_date.strftime("%d/%m/%Y"), scenarios,
                           total_orders=len(orders), computed_at=computed_at)
-
 
 if __name__ == "__main__":
     main()
