@@ -457,31 +457,73 @@ SWEEP_ORDER_PENALTY = int(_env_num("SWEEP_ORDER_PENALTY", 50_000))
 SWEEP_ORDER_BANDS = int(_env_num("SWEEP_ORDER_BANDS", 3))
 
 
-def _compute_distance_bands(dist_from_depot, n_bands):
-    """Assigns each stop (by index, depot excluded) a band number based
-    on its distance from the depot, using quantiles of THIS ROUTE's own
-    distances - band 0 is the farthest third (or n_bands-th), the
-    highest band number is nearest the depot. Quantile-based rather than
-    a fixed km threshold, since what counts as "far" varies by cluster -
-    a tightly-packed urban cluster and a spread-out rural one shouldn't
-    use the same absolute cutoff.
+def _geographic_sub_cluster_order(stop_nodes, locations, n_sub_clusters, depot_lat, depot_lng):
+    """Groups a vehicle's already-decided stops into n_sub_clusters
+    geographically-compact groups (farthest-point-seeded, nearest-
+    assignment - the same style of clustering used for the top-level
+    vehicle zones, just applied within one vehicle's own stops), then
+    orders those sub-clusters by their CENTROID's distance from the
+    depot (farthest sub-cluster first).
+
+    This replaced an earlier radial "distance band" approach (quantiles
+    of straight-line distance from depot) that had a real flaw: two
+    points can be the same radial distance from the depot while being in
+    completely different directions, and conversely a single tight
+    geographic group's own stops can span a RANGE of individual
+    distances-from-depot wide enough to land in different quantile
+    bands purely by that math - splitting a group that should be
+    cleared together. Grouping by actual mutual proximity first avoids
+    both problems: stops that are genuinely near each other end up in
+    the same sub-cluster regardless of their individual distance from
+    depot, and stops in different directions don't get conflated just
+    because they're radially similar.
+
+    Returns a dict mapping each stop's global node index to a sub-
+    cluster rank (0 = farthest sub-cluster, cleared first).
     """
-    n_bands = max(1, min(n_bands, len(dist_from_depot) - 1)) if len(dist_from_depot) > 1 else 1
-    ranked = sorted(range(1, len(dist_from_depot)), key=lambda i: -dist_from_depot[i])  # farthest first
-    band_size = max(1, -(-len(ranked) // n_bands))  # ceiling division
-    band_of = {0: 0}
-    for rank, idx in enumerate(ranked):
-        band_of[idx] = min(rank // band_size, n_bands - 1)
-    return band_of
+    if len(stop_nodes) <= 1:
+        return {n: 0 for n in stop_nodes}
+
+    n_sub_clusters = max(1, min(n_sub_clusters, len(stop_nodes)))
+    points = {n: (locations[n]["lat"], locations[n]["lng"]) for n in stop_nodes}
+
+    seeds = [max(stop_nodes, key=lambda n: haversine_km(points[n][0], points[n][1], depot_lat, depot_lng))]
+    while len(seeds) < n_sub_clusters:
+        remaining = [n for n in stop_nodes if n not in seeds]
+        if not remaining:
+            break
+        seeds.append(max(remaining, key=lambda n: min(
+            haversine_km(points[n][0], points[n][1], points[s][0], points[s][1]) for s in seeds
+        )))
+
+    sub_cluster_of_node = {}
+    for n in stop_nodes:
+        nearest_seed = min(seeds, key=lambda s: haversine_km(points[n][0], points[n][1], points[s][0], points[s][1]))
+        sub_cluster_of_node[n] = seeds.index(nearest_seed)
+
+    # Order sub-clusters by their own centroid's distance from depot,
+    # farthest first - this is what turns "sub-cluster index" (arbitrary,
+    # from seed order) into "sub-cluster rank" (0 = clear first).
+    members_by_cluster = {}
+    for n, c in sub_cluster_of_node.items():
+        members_by_cluster.setdefault(c, []).append(n)
+    cluster_centroid_dist = {}
+    for c, members in members_by_cluster.items():
+        centroid_lat = sum(points[n][0] for n in members) / len(members)
+        centroid_lng = sum(points[n][1] for n in members) / len(members)
+        cluster_centroid_dist[c] = haversine_km(centroid_lat, centroid_lng, depot_lat, depot_lng)
+    rank_of_cluster = {c: rank for rank, c in enumerate(sorted(cluster_centroid_dist, key=lambda c: -cluster_centroid_dist[c]))}
+
+    return {n: rank_of_cluster[c] for n, c in sub_cluster_of_node.items()}
 
 
-def _resequence_for_sweep(stop_nodes, dist_km):
+def _resequence_for_sweep(stop_nodes, dist_km, locations):
     """Given a FIXED list of location indices that a vehicle must ALL
     visit (already decided by the main solve above - this never changes
     which stops are served), finds the best VISIT ORDER biased toward a
-    farthest-first sweep pattern: clear the farthest stops first, then
-    work back toward the depot, rather than an order that could ping-
-    pong between near and far.
+    farthest-first sweep pattern: clear the farthest geographic sub-
+    cluster first, then work back toward the depot, rather than an
+    order that could ping-pong between sub-clusters.
 
     This is intentionally a completely separate, second-pass TSP solve
     with NO disjunctions and no time/capacity dimensions - every stop
@@ -505,14 +547,13 @@ def _resequence_for_sweep(stop_nodes, dist_km):
     sub_manager = pywrapcp.RoutingIndexManager(n + 1, 1, 0)
     sub_routing = pywrapcp.RoutingModel(sub_manager)
 
-    dists_from_depot = [dist_km[0][g] for g in local_to_global]
-    band_of = _compute_distance_bands(dists_from_depot, SWEEP_ORDER_BANDS)
+    sub_cluster_rank = _geographic_sub_cluster_order(stop_nodes, locations, SWEEP_ORDER_BANDS, DEPOT_LAT, DEPOT_LNG)
 
     def sub_dist_cb(f, t):
         i, j = sub_manager.IndexToNode(f), sub_manager.IndexToNode(t)
         gi, gj = local_to_global[i], local_to_global[j]
         cost = int(round(dist_km[gi][gj] * 1000))
-        if i != 0 and j != 0 and band_of.get(j, 0) < band_of.get(i, 0):
+        if i != 0 and j != 0 and sub_cluster_rank.get(gj, 0) < sub_cluster_rank.get(gi, 0):
             cost += SWEEP_ORDER_PENALTY
         return cost
 
@@ -596,7 +637,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
         # the farthest stops first. See _resequence_for_sweep for why
         # this has to be a separate pass rather than baked into the main
         # solve's cost function.
-        node_order = _resequence_for_sweep(node_order, dist_km)
+        node_order = _resequence_for_sweep(node_order, dist_km, locations)
 
         seq = box = dist = arr_min = 0
         prev = 0
