@@ -535,23 +535,29 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 
 
 def _spread_priority_anchors(orders, n_clusters, depot_lat, depot_lng):
-    """Picks n_clusters anchor orders. The first is the single oldest
-    order overall - guaranteeing it gets a dedicated route rather than
-    being just one of many candidates an anchor happens to be near.
-    Remaining anchors are picked via farthest-point sampling across the
-    FULL order set (not just old orders) - this matters: if every anchor
-    were drawn only from the oldest orders, a dense pocket of newer
-    orders somewhere else gets no anchor of its own at all, and whichever
-    anchor happens to be nearest just absorbs the entire pocket by
-    default, regardless of how it distorts that vehicle's route. Spreading
-    the remaining anchors across everyone ensures every dense region gets
-    proper geographic coverage, while the oldest order still keeps its
-    protected, dedicated anchor.
+    """Picks n_clusters anchor orders, purely by geographic spread - the
+    first is whichever order is farthest from the depot, and each
+    subsequent one is farthest from every anchor already picked.
+
+    Previously the first anchor was forced to be the single oldest order,
+    regardless of where it sat geographically - intended to protect old
+    orders from being scattered thin. In practice this conflated two
+    different concerns: WHICH vehicle's zone an order belongs to (should
+    be pure geography, so zones stay compact and don't overlap) versus
+    WHETHER an old order gets served instead of backlogged (already
+    handled correctly by the exponential age-penalty in solve_routing(),
+    independent of clustering). When the oldest order happened to be
+    geographically isolated, anchoring a zone there - and then letting
+    centroid refinement pull that zone toward a nearby dense pocket to
+    make the anchor "useful" - produced exactly the cross-zone reach
+    this was meant to prevent: one vehicle's territory stretching into
+    where another vehicle's stops already are. Pure geographic spread
+    avoids that; old orders still get priority for being served, just
+    within whichever zone they naturally geographically belong to.
     """
     if not orders:
         return []
-    oldest = max(orders, key=lambda o: (o.get("age", 0), o.get("box", 0)))
-    anchors = [oldest]
+    anchors = [max(orders, key=lambda o: haversine_km(o["lat"], o["lng"], depot_lat, depot_lng))]
     while len(anchors) < n_clusters and len(anchors) < len(orders):
         remaining = [o for o in orders if o not in anchors]
         if not remaining:
