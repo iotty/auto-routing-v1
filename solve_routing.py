@@ -444,6 +444,100 @@ def build_distance_time_matrices(locations):
     dist_km, time_min = build_haversine_matrices(locations)
     return dist_km, _apply_traffic_buffer(time_min)
 
+# How strongly a route is biased toward visiting farther stops before
+# closer ones (a "sweep out, then work back toward the depot" pattern),
+# rather than letting pure distance-minimization decide the order freely.
+# This is a preference, not a hard rule - the arc cost still wins if
+# violating sweep order saves enough real distance, so a route won't
+# take a genuinely wasteful detour just to satisfy this. In cost units
+# (km * 1000): 30,000 means "treat moving from a closer band toward a
+# farther one as if it cost 30 extra km," strong enough to reliably
+# discourage backward moves without being absolute.
+SWEEP_ORDER_PENALTY = int(_env_num("SWEEP_ORDER_PENALTY", 50_000))
+SWEEP_ORDER_BANDS = int(_env_num("SWEEP_ORDER_BANDS", 3))
+
+
+def _compute_distance_bands(dist_from_depot, n_bands):
+    """Assigns each stop (by index, depot excluded) a band number based
+    on its distance from the depot, using quantiles of THIS ROUTE's own
+    distances - band 0 is the farthest third (or n_bands-th), the
+    highest band number is nearest the depot. Quantile-based rather than
+    a fixed km threshold, since what counts as "far" varies by cluster -
+    a tightly-packed urban cluster and a spread-out rural one shouldn't
+    use the same absolute cutoff.
+    """
+    n_bands = max(1, min(n_bands, len(dist_from_depot) - 1)) if len(dist_from_depot) > 1 else 1
+    ranked = sorted(range(1, len(dist_from_depot)), key=lambda i: -dist_from_depot[i])  # farthest first
+    band_size = max(1, -(-len(ranked) // n_bands))  # ceiling division
+    band_of = {0: 0}
+    for rank, idx in enumerate(ranked):
+        band_of[idx] = min(rank // band_size, n_bands - 1)
+    return band_of
+
+
+def _resequence_for_sweep(stop_nodes, dist_km):
+    """Given a FIXED list of location indices that a vehicle must ALL
+    visit (already decided by the main solve above - this never changes
+    which stops are served), finds the best VISIT ORDER biased toward a
+    farthest-first sweep pattern: clear the farthest stops first, then
+    work back toward the depot, rather than an order that could ping-
+    pong between near and far.
+
+    This is intentionally a completely separate, second-pass TSP solve
+    with NO disjunctions and no time/capacity dimensions - every stop
+    given here IS visited, full stop, since which stops to include was
+    already decided by the main solve. That separation matters: an
+    earlier version applied this same sweep bias directly inside the
+    main solve's cost function, and confirmed via direct testing that it
+    caused the solver to drop entire groups of far stops to backlog
+    rather than just reorder them, when the accumulated sweep penalty
+    across a route could exceed the backlog-avoidance penalty for a
+    still-new order. Running it as a separate, mandatory-visit-all
+    problem makes that failure mode structurally impossible - there's no
+    disjunction to fall back to here, so the sweep bias can only ever
+    change the order, never drop a stop.
+    """
+    if len(stop_nodes) <= 1:
+        return list(stop_nodes)
+
+    n = len(stop_nodes)
+    local_to_global = [0] + list(stop_nodes)  # local index 0 = depot (global index 0)
+    sub_manager = pywrapcp.RoutingIndexManager(n + 1, 1, 0)
+    sub_routing = pywrapcp.RoutingModel(sub_manager)
+
+    dists_from_depot = [dist_km[0][g] for g in local_to_global]
+    band_of = _compute_distance_bands(dists_from_depot, SWEEP_ORDER_BANDS)
+
+    def sub_dist_cb(f, t):
+        i, j = sub_manager.IndexToNode(f), sub_manager.IndexToNode(t)
+        gi, gj = local_to_global[i], local_to_global[j]
+        cost = int(round(dist_km[gi][gj] * 1000))
+        if i != 0 and j != 0 and band_of.get(j, 0) < band_of.get(i, 0):
+            cost += SWEEP_ORDER_PENALTY
+        return cost
+
+    sub_dist_idx = sub_routing.RegisterTransitCallback(sub_dist_cb)
+    sub_routing.SetArcCostEvaluatorOfAllVehicles(sub_dist_idx)
+
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    params.time_limit.FromSeconds(3)  # small, already-fixed stop set - should solve quickly
+
+    solution = sub_routing.SolveWithParameters(params)
+    if not solution:
+        return list(stop_nodes)  # fall back to the original order if this ever fails
+
+    new_order = []
+    idx = sub_routing.Start(0)
+    while not sub_routing.IsEnd(idx):
+        node = sub_manager.IndexToNode(idx)
+        if node != 0:
+            new_order.append(local_to_global[node])
+        idx = solution.Value(sub_routing.NextVar(idx))
+    return new_order
+
+
 def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + orders
     manager = pywrapcp.RoutingIndexManager(len(locations), num_vehicles, 0)
@@ -489,43 +583,68 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     routes, visited, summary = [], set(), []
     for v_id in range(num_vehicles):
         idx = routing.Start(v_id)
-        seq = box = dist = 0
-        prev = 0
-        v_route = []
-
+        node_order = []
         while not routing.IsEnd(idx):
             node = manager.IndexToNode(idx)
             if node != 0:
-                seq += 1; visited.add(node)
-                box += locations[node].get("box", 0)
-                dist += dist_km[prev][node]
-                arr_min = solution.Value(time_dim.CumulVar(idx))
-                stop_service_min = service_time_minutes(locations[node].get("box", 0))
-                v_route.append({
-                    "vehicle": VEHICLES[v_id]["name"], "driver": VEHICLES[v_id]["driver"],
-                    "nopol": VEHICLES[v_id].get("nopol", ""), "seq": seq,
-                    "kode_fulfillment": locations[node]["kode_fulfillment"],
-                    "nama_penerima": locations[node]["nama_penerima"],
-                    "alamat_penerima": locations[node]["alamat_penerima"],
-                    "lat": locations[node]["lat"], "lng": locations[node]["lng"],
-                    "box": locations[node].get("box", 0), "cumulative_box": box,
-                    "eta": f"{(SHIFT_START_HOUR * 60 + arr_min) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + arr_min) % 60:02.0f}",
-                    "etd": f"{(SHIFT_START_HOUR * 60 + arr_min + stop_service_min) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + arr_min + stop_service_min) % 60:02.0f}",
-                    "distance_from_prev_km": dist_km[prev][node], "tanggal_masuk": locations[node]["tanggal_masuk"],
-                    "nomor_awb": locations[node].get("nomor_awb", ""),
-                    "kabupaten_kota": locations[node].get("kabupaten_kota", ""),
-                    "jam_masuk": locations[node].get("jam_masuk", ""),
-                    "jumlah_bku": locations[node].get("jumlah_bku", locations[node].get("box", 0)),
-                    "age": locations[node].get("age", 0),
-                })
-                prev = node
+                node_order.append(node)
             idx = solution.Value(routing.NextVar(idx))
 
-        dist += dist_km[prev][manager.IndexToNode(idx)]
+        # Which stops this vehicle serves is now fully decided (from the
+        # main solve above, including the age-priority backlog logic) -
+        # only the VISIT ORDER changes from here, biased toward clearing
+        # the farthest stops first. See _resequence_for_sweep for why
+        # this has to be a separate pass rather than baked into the main
+        # solve's cost function.
+        node_order = _resequence_for_sweep(node_order, dist_km)
+
+        seq = box = dist = arr_min = 0
+        prev = 0
+        v_route = []
+        for node in node_order:
+            seq += 1; visited.add(node)
+            box += locations[node].get("box", 0)
+            leg_dist = dist_km[prev][node]
+            dist += leg_dist
+            # Recomputed manually to match the new sweep order - the
+            # original solver's own CumulVar values reflected ITS visit
+            # order, not this one. Same formula as time_cb above:
+            # arrival at this stop = previous arrival + previous stop's
+            # service time + travel time between them.
+            prev_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
+            arr_min = arr_min + prev_service_min + time_min[prev][node]
+            stop_service_min = service_time_minutes(locations[node].get("box", 0))
+            v_route.append({
+                "vehicle": VEHICLES[v_id]["name"], "driver": VEHICLES[v_id]["driver"],
+                "nopol": VEHICLES[v_id].get("nopol", ""), "seq": seq,
+                "kode_fulfillment": locations[node]["kode_fulfillment"],
+                "nama_penerima": locations[node]["nama_penerima"],
+                "alamat_penerima": locations[node]["alamat_penerima"],
+                "lat": locations[node]["lat"], "lng": locations[node]["lng"],
+                "box": locations[node].get("box", 0), "cumulative_box": box,
+                "eta": f"{(SHIFT_START_HOUR * 60 + round(arr_min)) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + round(arr_min)) % 60:02.0f}",
+                "etd": f"{(SHIFT_START_HOUR * 60 + round(arr_min) + stop_service_min) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + round(arr_min) + stop_service_min) % 60:02.0f}",
+                "distance_from_prev_km": leg_dist, "tanggal_masuk": locations[node]["tanggal_masuk"],
+                "nomor_awb": locations[node].get("nomor_awb", ""),
+                "kabupaten_kota": locations[node].get("kabupaten_kota", ""),
+                "jam_masuk": locations[node].get("jam_masuk", ""),
+                "jumlah_bku": locations[node].get("jumlah_bku", locations[node].get("box", 0)),
+                "age": locations[node].get("age", 0),
+            })
+            prev = node
+
+        final_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
+        # Distance for the return leg uses the real matrix; total time
+        # uses the same matrix's time value for that same leg, both
+        # already available rather than needing a separate estimate.
+        dist += dist_km[prev][0]
+        actual_return_time_min = time_min[prev][0] if prev != 0 else 0
+        total_time_min = arr_min + final_service_min + actual_return_time_min
+
         routes.extend(v_route)
         summary.append([
             VEHICLES[v_id]["name"], VEHICLES[v_id]["driver"], seq, box, round(dist, 2),
-            solution.Value(time_dim.CumulVar(idx)),
+            round(total_time_min),
             round(100.0 * box / VEHICLE_CAPACITY_BOX, 1) if VEHICLE_CAPACITY_BOX else 0,
             f"Consider backlogging - only {seq} stops" if 0 < seq < UTILIZATION_FLAG_THRESHOLD else ""
         ])
