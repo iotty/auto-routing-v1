@@ -892,60 +892,150 @@ def cluster_greedy_around_oldest(orders, n_clusters, capacity_box):
 # knowledge and a cluster genuinely gets "finished" rather than
 # perpetually reshuffled.
 #
-# The fix here is to compute each vehicle's zone centroid ONCE (either
-# bootstrapped automatically from the first run, or set by hand), persist
-# it in a `Routing_Zones` sheet, and on every subsequent run assign each
-# order to whichever vehicle's centroid it is geographically nearest to -
-# not to a freshly recomputed anchor. Set REBUILD_ZONES=1 for one run to
-# intentionally recompute and overwrite the locked centroids (e.g. after
-# a real shift in delivery volume/geography).
+# The fix is a proper SWEEP partition rather than a nearest-centroid
+# (Voronoi) split. Nearest-centroid can still leave two zones' boundaries
+# jagged or interleaved wherever their centroids sit close together. A
+# sweep instead: (1) finds the axis of greatest geographic spread among
+# today's orders via a 2x2 PCA - this adapts to whatever direction the
+# service area actually runs in, nothing hardcoded about compass
+# direction; (2) projects every order onto that single axis, reducing the
+# 2D problem to a 1D one; (3) sorts by that projection and cuts it into
+# NUM_VEHICLES contiguous, roughly volume-balanced slices. The result is
+# tight, non-overlapping straight-edged strips, not a scattered split -
+# this is what a real sweep-based VRP zoning looks like.
+#
+# The axis, its origin, and the resulting cut points are locked into a
+# `Routing_Zones` sheet on first run (or with REBUILD_ZONES=1) and reused
+# on every later run, so the same stretch of territory - not just "the
+# same rough area" - belongs to the same vehicle from one day to the next.
+def _principal_axis(orders):
+    """Direction (unit vector, in lat/lng space) of greatest spread among
+    the given orders, found via the eigenvector of the larger eigenvalue
+    of their 2x2 covariance matrix - the standard closed-form solution
+    for 2D PCA, so no matrix library is needed."""
+    mean_lat = sum(o["lat"] for o in orders) / len(orders)
+    mean_lng = sum(o["lng"] for o in orders) / len(orders)
+    sxx = syy = sxy = 0.0
+    for o in orders:
+        dx, dy = o["lat"] - mean_lat, o["lng"] - mean_lng
+        sxx += dx * dx
+        syy += dy * dy
+        sxy += dx * dy
+    n = len(orders)
+    sxx /= n; syy /= n; sxy /= n
+    theta = 0.5 * math.atan2(2 * sxy, sxx - syy)
+    return mean_lat, mean_lng, math.cos(theta), math.sin(theta)
+
+
+def _project(order, mean_lat, mean_lng, ax_lat, ax_lng):
+    """Signed position of one order along the locked axis, relative to
+    the locked origin - this single number is what gets sorted and cut
+    into bands, and what's compared against each band's locked range on
+    every later run."""
+    return (order["lat"] - mean_lat) * ax_lat + (order["lng"] - mean_lng) * ax_lng
+
+
 def _load_zones(spreadsheet):
     header, rows = _read_sheet_rows(spreadsheet, ZONES_SHEET)
     if not header or not rows:
         return None
     idx = {name: i for i, name in enumerate(header)}
-    zones = {}
+    bands = {}
+    mean_lat = mean_lng = ax_lat = ax_lng = None
     for row in rows:
         try:
             vehicle = row[idx["Vehicle"]]
-            lat = float(row[idx["Centroid Lat"]])
-            lng = float(row[idx["Centroid Lng"]])
+            cut_min_raw = row[idx["Cut Min"]]
+            cut_max_raw = row[idx["Cut Max"]]
+            cut_min = float("-inf") if str(cut_min_raw).strip() == "" else float(cut_min_raw)
+            cut_max = float("inf") if str(cut_max_raw).strip() == "" else float(cut_max_raw)
             if vehicle:
-                zones[vehicle] = (lat, lng)
+                bands[vehicle] = (cut_min, cut_max)
+            if mean_lat is None:
+                mean_lat = float(row[idx["Mean Lat"]])
+                mean_lng = float(row[idx["Mean Lng"]])
+                ax_lat = float(row[idx["Axis Lat"]])
+                ax_lng = float(row[idx["Axis Lng"]])
         except (ValueError, IndexError, KeyError):
             continue
-    return zones or None
+    if not bands or mean_lat is None:
+        return None
+    return {"mean": (mean_lat, mean_lng), "axis": (ax_lat, ax_lng), "bands": bands}
 
 
 def _write_zones(spreadsheet, zones):
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    rows = [[vehicle, lat, lng, now] for vehicle, (lat, lng) in zones.items()]
-    _write_sheet(spreadsheet, ZONES_SHEET, ["Vehicle", "Centroid Lat", "Centroid Lng", "Locked Since"], rows)
+    mean_lat, mean_lng = zones["mean"]
+    ax_lat, ax_lng = zones["axis"]
+    rows = []
+    for v in VEHICLES:
+        name = v["name"]
+        if name not in zones["bands"]:
+            continue
+        cut_min, cut_max = zones["bands"][name]
+        rows.append([
+            name,
+            "" if cut_min == float("-inf") else cut_min,
+            "" if cut_max == float("inf") else cut_max,
+            mean_lat, mean_lng, ax_lat, ax_lng, now,
+        ])
+    _write_sheet(spreadsheet, ZONES_SHEET,
+                 ["Vehicle", "Cut Min", "Cut Max", "Mean Lat", "Mean Lng", "Axis Lat", "Axis Lng", "Locked Since"],
+                 rows)
 
 
 def _bootstrap_zones(orders):
-    """One-time initial split, reusing the existing geographic clustering
-    logic to get a sensible starting point, then locking in each
-    resulting cluster's centroid as that vehicle's permanent zone."""
-    clusters, _ = cluster_greedy_around_oldest(orders, NUM_VEHICLES, VEHICLE_CAPACITY_BOX)
-    zones = {}
-    for vehicle, cluster_orders in zip(VEHICLES, clusters):
-        if cluster_orders:
-            zones[vehicle["name"]] = _centroid(cluster_orders)
-    return zones
+    """One-time initial sweep: finds the principal axis, sorts today's
+    orders along it, and cuts NUM_VEHICLES contiguous bands so each gets
+    roughly an equal share of total box volume (falling back to an equal
+    share of order COUNT for any order with no box value, so an all-zero
+    day still splits sensibly). The cut points between bands are what get
+    locked - not the orders themselves - so tomorrow's different order
+    mix still slots into the same bands."""
+    if not orders:
+        return None
+    mean_lat, mean_lng, ax_lat, ax_lng = _principal_axis(orders)
+    sorted_orders = sorted(orders, key=lambda o: _project(o, mean_lat, mean_lng, ax_lat, ax_lng))
+    total_volume = sum(o.get("box", 0) or 1 for o in sorted_orders)
+    target_per_vehicle = total_volume / NUM_VEHICLES
+
+    bands = {}
+    cut_min = float("-inf")
+    running = 0.0
+    v_idx = 0
+    for i, o in enumerate(sorted_orders):
+        running += o.get("box", 0) or 1
+        is_last_order = (i == len(sorted_orders) - 1)
+        is_last_vehicle = (v_idx == NUM_VEHICLES - 1)
+        if not is_last_vehicle and running >= target_per_vehicle:
+            proj = _project(o, mean_lat, mean_lng, ax_lat, ax_lng)
+            bands[VEHICLES[v_idx]["name"]] = (cut_min, proj)
+            cut_min = proj
+            running = 0.0
+            v_idx += 1
+        if is_last_order:
+            bands[VEHICLES[v_idx]["name"]] = (cut_min, float("inf"))
+
+    # Guards against having fewer orders than vehicles on the very first
+    # bootstrap run - any vehicle that never got a turn gets an empty band
+    # rather than being left out of the sheet entirely.
+    for v in VEHICLES:
+        bands.setdefault(v["name"], (cut_min, cut_min))
+
+    return {"mean": (mean_lat, mean_lng), "axis": (ax_lat, ax_lng), "bands": bands}
 
 
 def get_or_build_zones(spreadsheet, orders):
     force_rebuild = bool(os.environ.get("REBUILD_ZONES"))
     zones = None if force_rebuild else _load_zones(spreadsheet)
     if zones:
-        print(f"[zones] Using {len(zones)} locked zone centroid(s) from '{ZONES_SHEET}' "
+        print(f"[zones] Using {len(zones['bands'])} locked band(s) from '{ZONES_SHEET}' "
               f"(set REBUILD_ZONES=1 to recompute from scratch).")
         return zones
 
     print(f"[zones] {'REBUILD_ZONES set' if force_rebuild else 'No locked zones found'} - "
-          f"bootstrapping territories from today's orders and writing them to '{ZONES_SHEET}'. "
-          f"Future runs will reuse these centroids unless REBUILD_ZONES is set again.")
+          f"sweeping today's orders into fresh territory bands and writing them to '{ZONES_SHEET}'. "
+          f"Future runs will reuse these exact bands unless REBUILD_ZONES is set again.")
     zones = _bootstrap_zones(orders)
     if zones:
         _write_zones(spreadsheet, zones)
@@ -954,44 +1044,50 @@ def get_or_build_zones(spreadsheet, orders):
 
 def cluster_by_fixed_zones(orders, zones, capacity_box):
     """
-    Assigns each order to the vehicle whose LOCKED zone centroid it is
-    geographically nearest to. Centroids come from `zones` (loaded from
-    the Routing_Zones sheet) and do not move day to day - this is what
-    makes a vehicle's territory stick, instead of reshuffling based on
-    which orders happen to be outstanding today.
+    Assigns each order to the vehicle whose LOCKED band it falls into,
+    where a band is a contiguous range along the service area's
+    principal axis (see _bootstrap_zones). Bands persist across runs via
+    `zones`, loaded from Routing_Zones - so a strip of territory belongs
+    to the same vehicle from one day to the next, and the resulting split
+    is a set of tight, non-overlapping strips rather than a scattered or
+    interleaved one.
 
-    An order only fails to be assigned (and is backlogged) if its home
-    vehicle is already full for the day. Overflow is deliberately NOT
-    spilled into a neighboring vehicle's zone - doing that would quietly
-    blur territory boundaries over time and bring back the "vehicle ends
-    up somewhere new every day" problem this is meant to fix. If a zone
-    is consistently over capacity, the right fix is to grow that
-    vehicle's capacity/shift, split the zone into two (add a second
-    centroid row for a new vehicle), or add a truck - not to let routing
-    silently borrow a neighboring zone's stops.
+    An order only fails to be assigned (and is backlogged) if its own
+    band's vehicle is already full for the day. Overflow is deliberately
+    NOT spilled into a neighboring band - doing that would quietly blur
+    the boundary that's the whole point of locking it. If a band is
+    consistently over capacity, the right fix is to grow that vehicle's
+    capacity/shift, split the band in two (re-run with REBUILD_ZONES=1
+    after adding a vehicle), or add a truck - not to let routing silently
+    borrow a neighboring band's stops.
     """
-    vehicle_names = [v["name"] for v in VEHICLES]
-    clusters = {name: [] for name in vehicle_names}
-    loads = {name: 0.0 for name in vehicle_names}
+    mean_lat, mean_lng = zones["mean"]
+    ax_lat, ax_lng = zones["axis"]
+    bands = zones["bands"]
     max_stops = _estimated_max_stops_per_cluster()
+
+    clusters = {name: [] for name in bands}
+    loads = {name: 0.0 for name in bands}
     unassigned = []
 
     for order in orders:
-        candidates = sorted(
-            (name for name in vehicle_names if name in zones),
-            key=lambda name: haversine_km(order["lat"], order["lng"], zones[name][0], zones[name][1])
-        )
-        placed = False
-        for name in candidates:
-            if loads[name] + order.get("box", 0) <= capacity_box and len(clusters[name]) < max_stops:
-                clusters[name].append(order)
-                loads[name] += order.get("box", 0)
-                placed = True
-                break
-        if not placed:
+        proj = _project(order, mean_lat, mean_lng, ax_lat, ax_lng)
+        home = next((name for name, (lo, hi) in bands.items() if lo <= proj <= hi), None)
+        if home is None:
+            # Falls outside every locked band - can happen for a new order
+            # far beyond anything seen when the bands were cut. Falls back
+            # to whichever band's range is numerically closest, rather
+            # than backlogging something that's obviously still part of
+            # one end of the corridor.
+            home = min(bands, key=lambda name: min(abs(proj - bands[name][0]), abs(proj - bands[name][1])))
+
+        if loads[home] + order.get("box", 0) <= capacity_box and len(clusters[home]) < max_stops:
+            clusters[home].append(order)
+            loads[home] += order.get("box", 0)
+        else:
             unassigned.append(order)
 
-    return [clusters[name] for name in vehicle_names], unassigned
+    return [clusters[v["name"]] for v in VEHICLES], unassigned
 
 
 def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng, zones=None):
