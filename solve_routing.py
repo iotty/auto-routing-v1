@@ -6,8 +6,10 @@ Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
 
 Routing Strategy:
 1. Protects H+3 SLAs (Tier 1 Critical Priority).
-2. Prunes expensive geographic outliers for non-critical orders to save fleet fuel.
-3. Groups remaining stops into dense Latitudinal Bands (North to South) with zero overlap.
+2. Uses PCA math to find the delivery corridor and drop lateral outliers (Far East/West).
+3. Keeps Depth (Deep South) to clear distant regions and prevent repeat empty trips.
+4. Groups stops into dense Latitudinal Bands (North to South) with zero overlap.
+5. Trusts Google OR-Tools Guided Local Search to sequence stops perfectly without overlapping.
 """
 
 import os
@@ -153,9 +155,9 @@ def load_orders(spreadsheet):
 
 def parse_date_flexible(value):
     if not value: return None
-    for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+    for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
         try:
-            return datetime.datetime.strptime(value.strip(), fmt).date()
+            return datetime.datetime.strptime(str(value).strip(), fmt).date()
         except ValueError: continue
     return None
 
@@ -430,45 +432,6 @@ def build_distance_time_matrices(locations):
     return dist_km, _apply_traffic_buffer(time_min)
 
 
-def _nearest_neighbor_order(stop_nodes, dist_km):
-    remaining = set(stop_nodes)
-    order = []
-    prev = 0
-    while remaining:
-        nxt = min(remaining, key=lambda n: dist_km[prev][n])
-        order.append(nxt)
-        remaining.discard(nxt)
-        prev = nxt
-    return order
-
-
-def _two_opt_improve(order_seq, dist_km, max_passes=30):
-    n = len(order_seq)
-    if n < 3:
-        return order_seq
-    route = [0] + list(order_seq) + [0]
-    improved = True
-    passes = 0
-    while improved and passes < max_passes:
-        improved = False
-        passes += 1
-        for i in range(1, n):
-            for j in range(i + 1, n + 1):
-                a, b = route[i - 1], route[i]
-                c, d = route[j], route[j + 1] if j + 1 < len(route) else route[0]
-                if dist_km[a][b] + dist_km[c][d] > dist_km[a][c] + dist_km[b][d] + 1e-9:
-                    route[i:j + 1] = reversed(route[i:j + 1])
-                    improved = True
-    return route[1:-1]
-
-
-def _resequence_route(stop_nodes, dist_km, locations):
-    if len(stop_nodes) <= 1:
-        return list(stop_nodes)
-    nn_order = _nearest_neighbor_order(stop_nodes, dist_km)
-    return _two_opt_improve(nn_order, dist_km)
-
-
 def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + orders
     manager = pywrapcp.RoutingIndexManager(len(locations), num_vehicles, 0)
@@ -509,13 +472,13 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     for v_id in range(num_vehicles):
         idx = routing.Start(v_id)
         node_order = []
+        
+        # We rely 100% on the optimized OR-Tools sequence here. No custom greedy resequencing.
         while not routing.IsEnd(idx):
             node = manager.IndexToNode(idx)
             if node != 0:
                 node_order.append(node)
             idx = solution.Value(routing.NextVar(idx))
-
-        node_order = _resequence_route(node_order, dist_km, locations)
 
         seq = box = dist = arr_min = 0
         prev = 0
@@ -579,10 +542,11 @@ def _estimated_max_stops_per_cluster():
     return max(5, int(EFFECTIVE_SHIFT_MINUTES / per_stop_min))
 
 
-def _calculate_mahalanobis_distances(orders):
+def _calculate_lateral_distances(orders):
     """
-    Pure Python calculation of Mahalanobis Distance to find statistical outliers.
-    Penalizes points that stray too far East/West/South from the dense central corridor.
+    Pure Python PCA approximation.
+    Finds the main North-South delivery corridor and calculates how far 
+    East or West (Lateral Distance) each order is from that main line.
     """
     n = len(orders)
     if n < 2:
@@ -591,46 +555,72 @@ def _calculate_mahalanobis_distances(orders):
     mean_lat = sum(o['lat'] for o in orders) / n
     mean_lng = sum(o['lng'] for o in orders) / n
     
-    var_lat = sum((o['lat'] - mean_lat)**2 for o in orders) / (n - 1)
-    var_lng = sum((o['lng'] - mean_lng)**2 for o in orders) / (n - 1)
-    cov_lat_lng = sum((o['lat'] - mean_lat) * (o['lng'] - mean_lng) for o in orders) / (n - 1)
+    cov_ll = sum((o['lat']-mean_lat)**2 for o in orders) / (n - 1) if n > 1 else 0
+    cov_gg = sum((o['lng']-mean_lng)**2 for o in orders) / (n - 1) if n > 1 else 0
+    cov_lg = sum((o['lat']-mean_lat)*(o['lng']-mean_lng) for o in orders) / (n - 1) if n > 1 else 0
     
-    det = (var_lat * var_lng) - (cov_lat_lng ** 2)
+    trace = cov_ll + cov_gg
+    det = cov_ll * cov_gg - cov_lg**2
     
-    if det == 0:
-        return [haversine_km(o['lat'], o['lng'], mean_lat, mean_lng) for o in orders]
+    # Calculate primary axis
+    inner = max(0, trace**2 - 4*det)
+    lambda1 = (trace + math.sqrt(inner)) / 2
         
-    distances = []
+    if cov_lg != 0:
+        vec1_lat = lambda1 - cov_gg
+        vec1_lng = cov_lg
+    else:
+        vec1_lat, vec1_lng = 1, 0
+        
+    mag = math.hypot(vec1_lat, vec1_lng)
+    if mag == 0:
+        vec1_lat, vec1_lng = 1, 0
+    else:
+        vec1_lat /= mag
+        vec1_lng /= mag
+    
+    # Normal vector (perpendicular to the corridor)
+    norm_lat = -vec1_lng
+    norm_lng = vec1_lat
+    
+    lateral_dists = []
     for o in orders:
         dx = o['lat'] - mean_lat
         dy = o['lng'] - mean_lng
+        lateral_dists.append(abs(dx * norm_lat + dy * norm_lng))
         
-        d_sq = (var_lng * (dx ** 2) - 2 * cov_lat_lng * dx * dy + var_lat * (dy ** 2)) / det
-        distances.append(math.sqrt(max(0, d_sq)))
-        
-    return distances
+    return lateral_dists
 
 
-def cluster_tiered_statistical_core(orders, n_clusters, capacity_box):
+def cluster_smart_corridor_sweep(orders, n_clusters, capacity_box):
     """
-    Tiered Statistical Outlier Pruning:
-    1. Orders 3+ days old are Tier 1 (Critical) and MUST be delivered.
-    2. All other orders (0-2 days old) are pruned based on geographic outlier score.
-    3. The dense core is swept into perfectly non-overlapping horizontal bands.
+    Smart Corridor Strategy:
+    1. Critical Age (3+ days) are routed unconditionally.
+    2. Lateral Outliers (Far East/West) are dropped to the backlog.
+    3. Farthest Depth (Deep South) is prioritized to clear the edges.
+    4. Closest points to the depot are saved for tomorrow's backlog.
     """
     if not orders or n_clusters <= 0:
         return [[] for _ in range(n_clusters)], list(orders)
 
-    m_dists = _calculate_mahalanobis_distances(orders)
+    lateral_dists = _calculate_lateral_distances(orders)
+    
     for i, o in enumerate(orders):
-        o['outlier_score'] = m_dists[i]
-        # Tier 1 = H+3 or older (Must be delivered)
-        # Tier 0 = H+0 to H+2 (Subject to outlier pruning)
-        o['critical_tier'] = 1 if o.get('age', 0) >= 3 else 0
+        o['lateral_dist'] = lateral_dists[i]
+        o['dist'] = haversine_km(o['lat'], o['lng'], DEPOT_LAT, DEPOT_LNG)
+        o['critical'] = 1 if o.get('age', 0) >= 3 else 0
+        # Flag orders that stray too far East/West off the main corridor
+        o['is_lateral_outlier'] = 1 if o['lateral_dist'] > 0.05 else 0
         
-    # 1. Critical Tier DESCENDING (Force 3+ day old orders to the top of the list)
-    # 2. Outlier Score ASCENDING (Keep the tightest dense core, drop massive geographic outliers to the bottom)
-    orders_sorted_by_priority = sorted(orders, key=lambda x: (-x['critical_tier'], x['outlier_score']))
+    # The Ultimate Sorting Logic:
+    # 1. Critical orders first (-x['critical'])
+    # 2. Push lateral outliers to the bottom (x['is_lateral_outlier'])
+    # 3. Route the Farthest points first to clear the deep south (-x['dist'])
+    orders_sorted_by_priority = sorted(orders, key=lambda x: (
+        -x['critical'], 
+        x['is_lateral_outlier'], 
+        -x['dist']
+    ))
     
     max_stops = _estimated_max_stops_per_cluster()
     total_allowed_stops = n_clusters * max_stops
@@ -639,7 +629,6 @@ def cluster_tiered_statistical_core(orders, n_clusters, capacity_box):
     unassigned = []
     current_fleet_boxes = 0
     
-    # Filter down to ONLY the orders the fleet can physically serve today
     for o in orders_sorted_by_priority:
         fits_stop_count = len(selected_orders) < total_allowed_stops
         fits_box_count = (current_fleet_boxes + o.get('box', 0)) <= (n_clusters * capacity_box)
@@ -648,16 +637,14 @@ def cluster_tiered_statistical_core(orders, n_clusters, capacity_box):
             selected_orders.append(o)
             current_fleet_boxes += o.get('box', 0)
         else:
-            # Fleet is full; these expensive non-critical outliers go to backlog
             unassigned.append(o)
             
-    # Spatial Sweep: Sort ONLY the scheduled dense core by LATITUDE (North to South)
+    # Spatial Sweep: North to South horizontal bands
     selected_orders_by_lat = sorted(selected_orders, key=lambda x: x['lat'], reverse=True)
     
     clusters = [[] for _ in range(n_clusters)]
     cluster_loads = [0.0] * n_clusters
     
-    # Distribute sequentially along the horizontal bands with Zero Spillover
     current_cluster = 0
     for order in selected_orders_by_lat:
         if (len(clusters[current_cluster]) >= max_stops) or \
@@ -676,12 +663,12 @@ def cluster_tiered_statistical_core(orders, n_clusters, capacity_box):
 
 
 def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
-    clusters, unassigned = cluster_tiered_statistical_core(orders, n, VEHICLE_CAPACITY_BOX)
-    unassigned_reason = "Outlier / No capacity left in fleet time budget"
+    # Dynamically assign horizontal bands while dropping lateral outliers
+    clusters, unassigned = cluster_smart_corridor_sweep(orders, n, VEHICLE_CAPACITY_BOX)
+    unassigned_reason = "Lateral Outlier / Time Limit Cutoff"
 
     all_routes, all_backlog, all_summary = [], [], []
 
-    # Any order that didn't fit into ANY truck's capacity phase is backlogged immediately
     for o in unassigned:
         all_backlog.append({**o, "backlog_reason": unassigned_reason})
         
