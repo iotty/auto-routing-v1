@@ -2,14 +2,13 @@
 Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
-3 vehicles subject to strict 9-hour time limits.
+3 vehicles subject to strict 9-hour time limits, and writes the plan to Sheets.
 
 Routing Strategy:
 1. Protects H+3 SLAs (Tier 1 Critical Priority).
-2. Uses PCA math to drop lateral outliers (Far East/West) to save fuel.
-3. Keeps Depth (Deep South) to clear distant regions and prevent repeat empty trips.
-4. Uses SAVINGS heuristic to build beautiful non-overlapping petal routes.
-5. Uses GlobalSpanCost to perfectly balance driver time workloads.
+2. Uses PCA math to unconditionally drop non-critical lateral outliers (Far East/West).
+3. Trusts Google OR-Tools natively to balance route Time across all vehicles.
+4. Uses Native OR-Tools SAVINGS heuristic for smooth, circular, non-overlapping routes.
 """
 
 import os
@@ -363,6 +362,7 @@ OSRM_DEMO_MAX_POINTS = 100
 def build_osrm_demo_matrices(locations):
     if len(locations) > OSRM_DEMO_MAX_POINTS:
         raise RuntimeError(f"{len(locations)} points exceeds demo limit.")
+    
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
     url = OSRM_DEMO_URL + coords
     
@@ -371,6 +371,7 @@ def build_osrm_demo_matrices(locations):
                             headers={"User-Agent": "auto-routing-vrp/1.0"})
     response.raise_for_status()
     data = response.json()
+
     if data.get("code") != "Ok":
         raise RuntimeError(f"OSRM demo server returned: {data.get('code')} - {data.get('message', '')}")
 
@@ -441,11 +442,11 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     dist_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(dist_idx)
 
-    # 1. ENFORCE TIME DIMENSION WITH GLOBAL SPAN (BALANCING)
+    # 1. ENFORCE TIME BALANCING
     time_idx = routing.RegisterTransitCallback(time_cb)
     routing.AddDimension(time_idx, 0, EFFECTIVE_SHIFT_MINUTES, True, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
-    time_dim.SetGlobalSpanCostCoefficient(100)
+    time_dim.SetGlobalSpanCostCoefficient(100) # Forces all 3 drivers to have roughly equal route times
 
     routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(load_cb), 0, [VEHICLE_CAPACITY_BOX] * num_vehicles, True, "Capacity")
     routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(stop_cb), 0, [len(orders)] * num_vehicles, True, "StopCount")
@@ -457,7 +458,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
         routing.AddDisjunction([manager.NodeToIndex(idx)], penalty)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
-    # 2. USE SAVINGS ALGORITHM TO BUILD PERFECT PETAL ROUTES (NO SPAGHETTI)
+    # 2. USE SAVINGS ALGORITHM TO BUILD PERFECT PETAL ROUTES
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.SAVINGS
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     params.time_limit.FromSeconds(SOLVE_TIME_LIMIT_SECONDS)
@@ -467,7 +468,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 
     routes, visited, summary = [], set(), []
     
-    # 3. DIRECT SEQUENCE EXTRACTION (No Greedy Resequencing)
+    # 3. DIRECT SEQUENCE EXTRACTION (No custom resequencing)
     for v_id in range(num_vehicles):
         idx = routing.Start(v_id)
         node_order = []
@@ -522,7 +523,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
             f"Consider backlogging - only {seq} stops" if 0 < seq < UTILIZATION_FLAG_THRESHOLD else ""
         ])
 
-    backlog = [{**locations[i], "backlog_reason": "Time limit exceeded (Dropped by OR-Tools)"} for i in range(1, len(locations)) if i not in visited]
+    backlog = [{**locations[i], "backlog_reason": "Time limit exceeded (Dropped by OR-Tools Load Balancer)"} for i in range(1, len(locations)) if i not in visited]
     return routes, backlog, summary
 
 
@@ -530,6 +531,11 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 # PRE-FILTERING (SMART OUTLIER DROPPING)
 # ==========================================
 def _calculate_lateral_distances(orders):
+    """
+    Pure Python PCA approximation.
+    Finds the main North-South delivery corridor and calculates how far 
+    East or West (Lateral Distance) each order is from that main line.
+    """
     n = len(orders)
     if n < 2: return [0]*n
         
@@ -555,15 +561,20 @@ def _calculate_lateral_distances(orders):
     else: vec1_lat, vec1_lng = vec1_lat/mag, vec1_lng/mag
     
     norm_lat, norm_lng = -vec1_lng, vec1_lat
-    lateral_dists = []
     
+    lateral_dists = []
     for o in orders:
         dx = o['lat'] - mean_lat
         dy = o['lng'] - mean_lng
         lateral_dists.append(abs(dx * norm_lat + dy * norm_lng))
+        
     return lateral_dists
 
 def select_smart_orders(orders, n_vehicles, capacity_box):
+    """
+    Explicitly drops non-critical lateral outliers unconditionally to save fuel.
+    Passes the remaining valid orders straight to OR-Tools for native balancing.
+    """
     if not orders or n_vehicles <= 0:
         return [], list(orders)
 
@@ -588,6 +599,13 @@ def select_smart_orders(orders, n_vehicles, capacity_box):
     current_fleet_boxes = 0
     
     for o in orders_sorted_by_priority:
+        # THE FIX: Explicitly and unconditionally drop non-critical outliers 
+        # BEFORE checking fleet limits, ensuring the Green Truck never "goes around the earth".
+        if o['is_lateral_outlier'] == 1 and o['critical'] == 0:
+            o['backlog_reason'] = "Lateral Outlier (Geographic Pruning)"
+            unassigned.append(o)
+            continue
+            
         fits_stop_count = len(selected_orders) < total_allowed_stops
         fits_box_count = (current_fleet_boxes + o.get('box', 0)) <= (n_vehicles * capacity_box)
         
@@ -595,7 +613,7 @@ def select_smart_orders(orders, n_vehicles, capacity_box):
             selected_orders.append(o)
             current_fleet_boxes += o.get('box', 0)
         else:
-            o['backlog_reason'] = "Lateral Outlier / Time Budget Cutoff"
+            o['backlog_reason'] = "Time Budget Cutoff"
             unassigned.append(o)
             
     return selected_orders, unassigned
@@ -606,12 +624,17 @@ def solve_all_scenarios(orders, route_date):
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
+            # 1. Unconditionally drop non-critical lateral outliers
             selected_orders, pre_backlog = select_smart_orders(orders, n, VEHICLE_CAPACITY_BOX)
             
+            # 2. Build matrices ONLY for the selected orders
             locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + selected_orders
             dist_km, time_min = build_distance_time_matrices(locations)
             
+            # 3. Solve all vehicles AT THE SAME TIME
             routes, solver_backlog, summary = solve_routing(selected_orders, route_date, n, dist_km, time_min)
+            
+            # Combine the manual outlier backlog with any excess OR-Tools had to drop
             final_backlog = pre_backlog + solver_backlog
             
             print(f"  Served {sum(row[2] for row in summary)}/{len(orders)}, backlog {len(final_backlog)}, dist {sum(row[4] for row in summary):.1f}km")
