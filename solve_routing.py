@@ -2,14 +2,14 @@
 Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
-3 vehicles subject to strict 9-hour time limits.
+vehicles subject to strict 9-hour time limits, and outputs the plan to Sheets.
 
 Routing Strategy:
 1. Protects H+3 SLAs (Tier 1 Critical Priority).
-2. Uses PCA math to drop lateral outliers (Far East/West) to save fuel.
-3. Keeps Depth (Deep South) to clear distant regions and prevent repeat empty trips.
-4. Trusts Google OR-Tools natively to balance the Time (not just stop counts) across 
-   all vehicles and sequence the stops smoothly without abstract overlapping.
+2. Uses PCA math to identify the delivery corridor and drop lateral outliers (Far East/West).
+3. Keeps Depth (Deep South) to clear distant edges and prevent repeat empty trips.
+4. Trusts Google OR-Tools natively to balance route Time across all vehicles.
+5. Uses Native OR-Tools Sequencing for smooth, non-overlapping circular routes.
 """
 
 import os
@@ -60,6 +60,7 @@ SERVICE_TIME_BASE_MINUTES = int(_env_num("SERVICE_TIME_MINUTES", 15))
 SERVICE_TIME_FREE_BOX_THRESHOLD = int(_env_num("SERVICE_TIME_FREE_BOX_THRESHOLD", 6))
 SERVICE_TIME_PER_EXTRA_BOX_MINUTES = _env_num("SERVICE_TIME_PER_EXTRA_BOX_MINUTES", 1)
 
+
 def service_time_minutes(box_count):
     if box_count < SERVICE_TIME_FREE_BOX_THRESHOLD:
         return SERVICE_TIME_BASE_MINUTES
@@ -108,13 +109,16 @@ def get_spreadsheet():
     creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
     gc = gspread.authorize(creds)
     os.remove(creds_path)
+
     return gc.open_by_key(spreadsheet_id)
+
 
 def _safe_col(row, idx, col_name, default=""):
     i = idx.get(col_name)
     if i is None or i >= len(row):
         return default
     return row[i]
+
 
 def load_orders(spreadsheet):
     sheet = spreadsheet.worksheet(SOURCE_SHEET)
@@ -147,6 +151,7 @@ def load_orders(spreadsheet):
             continue
     return orders
 
+
 def parse_date_flexible(value):
     if not value: return None
     for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
@@ -154,6 +159,7 @@ def parse_date_flexible(value):
             return datetime.datetime.strptime(str(value).strip(), fmt).date()
         except ValueError: continue
     return None
+
 
 def write_routing_output(spreadsheet, route_date, scenarios, total_orders=0, computed_at=""):
     comparison_rows = []
@@ -225,6 +231,7 @@ def write_routing_output(spreadsheet, route_date, scenarios, total_orders=0, com
         "Total Orders Considered", "Computed At", "Distance Source(s) Used",
     ], comparison_rows, route_date)
 
+
 def _read_sheet_rows(spreadsheet, sheet_name):
     try:
         worksheet = spreadsheet.worksheet(sheet_name)
@@ -235,14 +242,20 @@ def _read_sheet_rows(spreadsheet, sheet_name):
         return None, []
     return values[0], values[1:]
 
+
 def _upsert_sheet_by_date(spreadsheet, sheet_name, header, new_rows, route_date, max_retries=4):
     existing_header, existing_rows = _read_sheet_rows(spreadsheet, sheet_name)
+
     if existing_header and existing_header != header:
-        print(f"[{sheet_name}] WARNING: existing header doesn't match the current schema - rebuilding.")
+        print(f"[{sheet_name}] WARNING: existing header doesn't match the current schema - "
+              f"rebuilding this sheet from scratch (its prior history will be lost this one time).")
         existing_rows = []
+
     kept_rows = [row for row in existing_rows if len(row) == 0 or row[0] != route_date]
     combined_rows = kept_rows + new_rows
+
     return _write_sheet(spreadsheet, sheet_name, header, combined_rows, max_retries=max_retries)
+
 
 def fetch_route_geometry(depot_lat, depot_lng, stops):
     if not stops:
@@ -262,17 +275,22 @@ def fetch_route_geometry(depot_lat, depot_lng, stops):
         print(f"  [geometry] OSRM route call failed: {e}")
         return None
 
+
 def build_geometry_rows(route_date, routes):
     by_vehicle = {}
     for r in routes:
         by_vehicle.setdefault(r["vehicle"], []).append(r)
+
     geometry_rows = []
     for vehicle, stops in by_vehicle.items():
         stops_sorted = sorted(stops, key=lambda r: r["seq"])
         geometry = fetch_route_geometry(DEPOT_LAT, DEPOT_LNG, stops_sorted)
         if geometry:
             geometry_rows.append([route_date, vehicle, json.dumps(geometry)])
+        else:
+            print(f"  [geometry] no geometry captured for {vehicle} - dashboard will use a straight line for it")
     return geometry_rows
+
 
 def _write_sheet(spreadsheet, sheet_name, header, rows, max_retries=4):
     try:
@@ -290,6 +308,7 @@ def _write_sheet(spreadsheet, sheet_name, header, rows, max_retries=4):
             time.sleep(3 * (2 ** (attempt - 1)))
     return False
 
+
 # ==========================================
 # ROUTING & DISTANCE
 # ==========================================
@@ -300,6 +319,7 @@ def haversine_km(lat1, lng1, lat2, lng2):
     dlambda = math.radians(lng2 - lng1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
     return 2 * R * math.asin(math.sqrt(max(0.0, min(1.0, a))))
+
 
 def build_haversine_matrices(locations):
     n = len(locations)
@@ -312,13 +332,16 @@ def build_haversine_matrices(locations):
                 time_min[i][j] = (km / AVG_SPEED_KMH_FALLBACK) * 60.0
     return dist_km, time_min
 
+
 def build_osrm_local_matrices(locations):
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
     url = OSRM_URL + coords
+    
     print(f"[OSRM] Requesting {len(locations)}x{len(locations)} matrix from localhost...")
     response = requests.get(url, params={"annotations": "distance,duration"}, timeout=30)
     response.raise_for_status()
     data = response.json()
+
     distances_m, durations_s = data["distances"], data["durations"]
     n = len(locations)
     dist_km, time_min = [[0.0] * n for _ in range(n)], [[0.0] * n for _ in range(n)]
@@ -336,24 +359,31 @@ def build_osrm_local_matrices(locations):
                     time_min[i][j] = t / 60.0
     return dist_km, time_min
 
+
 OSRM_DEMO_URL = "https://router.project-osrm.org/table/v1/driving/"
 OSRM_DEMO_MAX_POINTS = 100
 
 def build_osrm_demo_matrices(locations):
     if len(locations) > OSRM_DEMO_MAX_POINTS:
-        raise RuntimeError(f"{len(locations)} points exceeds demo limit.")
+        raise RuntimeError(f"{len(locations)} points exceeds the demo server's practical "
+                            f"~{OSRM_DEMO_MAX_POINTS}-point limit for one table query.")
+
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
     url = OSRM_DEMO_URL + coords
-    print(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from public demo...")
+
+    print(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from the public demo server...")
     response = requests.get(url, params={"annotations": "distance,duration"}, timeout=30,
                             headers={"User-Agent": "auto-routing-vrp/1.0"})
     response.raise_for_status()
     data = response.json()
+
     if data.get("code") != "Ok":
         raise RuntimeError(f"OSRM demo server returned: {data.get('code')} - {data.get('message', '')}")
+
     distances_m, durations_s = data["distances"], data["durations"]
     n = len(locations)
     dist_km, time_min = [[0.0] * n for _ in range(n)], [[0.0] * n for _ in range(n)]
+
     for i in range(n):
         for j in range(n):
             if i != j:
@@ -366,6 +396,7 @@ def build_osrm_demo_matrices(locations):
                     dist_km[i][j] = d / 1000.0
                     time_min[i][j] = t / 60.0
     return dist_km, time_min
+
 
 TRAFFIC_TIME_MULTIPLIER = _env_num("TRAFFIC_TIME_MULTIPLIER", 1.5)
 
@@ -386,14 +417,14 @@ def build_distance_time_matrices(locations):
         DISTANCE_SOURCES_USED.add("Local OSRM")
         return dist_km, _apply_traffic_buffer(time_min)
     except Exception as e:
-        print(f"[OSRM] Local routing failed ({e}); trying public demo.")
+        print(f"[OSRM] Local routing server failed ({e}); trying the public OSRM demo server next.")
 
     try:
         dist_km, time_min = build_osrm_demo_matrices(locations)
         DISTANCE_SOURCES_USED.add("Public OSRM demo")
         return dist_km, _apply_traffic_buffer(time_min)
     except Exception as e:
-        print(f"[OSRM-demo] Failed ({e}); falling back to straight-line.")
+        print(f"[OSRM-demo] Also failed ({e}); falling back to straight-line distance.")
 
     DISTANCE_SOURCES_USED.add("Straight-line (all OSRM sources failed)")
     dist_km, time_min = build_haversine_matrices(locations)
@@ -416,13 +447,15 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     dist_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(dist_idx)
 
-    routing.AddDimension(routing.RegisterTransitCallback(time_cb), 0, EFFECTIVE_SHIFT_MINUTES, True, "Time")
+    # NATIVE LOAD BALANCING
+    # This prevents the AI from assigning 10 hours to one driver and 6 hours to another
+    time_idx = routing.RegisterTransitCallback(time_cb)
+    routing.AddDimension(time_idx, 0, EFFECTIVE_SHIFT_MINUTES, True, "Time")
+    time_dim = routing.GetDimensionOrDie("Time")
+    time_dim.SetGlobalSpanCostCoefficient(100)
+
     routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(load_cb), 0, [VEHICLE_CAPACITY_BOX] * num_vehicles, True, "Capacity")
-    
-    # We do NOT strictly limit StopCount so OR-Tools can naturally balance distance vs quantity
-    routing.AddDimensionWithVehicleCapacity(
-        routing.RegisterUnaryTransitCallback(stop_cb), 0,
-        [len(orders)] * num_vehicles, True, "StopCount")
+    routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(stop_cb), 0, [len(orders)] * num_vehicles, True, "StopCount")
 
     for idx in range(1, len(locations)):
         age = locations[idx].get("age", 0)
@@ -440,7 +473,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 
     routes, visited, summary = [], set(), []
     
-    # Directly pull the sequence from OR-Tools (No more custom resequencing!)
+    # Extract the sequence perfectly as OR-Tools optimized it. Zero greedy resequencing.
     for v_id in range(num_vehicles):
         idx = routing.Start(v_id)
         node_order = []
@@ -502,12 +535,11 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 # ==========================================
 # PRE-FILTERING (SMART OUTLIER DROPPING)
 # ==========================================
-def _estimated_max_stops_per_cluster():
-    avg_travel_min_estimate = 8  
-    per_stop_min = SERVICE_TIME_BASE_MINUTES + avg_travel_min_estimate
-    return max(5, int(EFFECTIVE_SHIFT_MINUTES / per_stop_min))
-
 def _calculate_lateral_distances(orders):
+    """
+    Pure Python PCA approximation. Finds the main North-South delivery 
+    corridor and flags orders that stray too far East or West.
+    """
     n = len(orders)
     if n < 2: return [0]*n
         
@@ -542,6 +574,10 @@ def _calculate_lateral_distances(orders):
     return lateral_dists
 
 def select_smart_orders(orders, n_vehicles, capacity_box):
+    """
+    Filters out the bad lateral outliers, keeps the Deep South depth, 
+    and passes a generous pool of orders directly into OR-Tools.
+    """
     if not orders or n_vehicles <= 0:
         return [], list(orders)
 
@@ -559,8 +595,10 @@ def select_smart_orders(orders, n_vehicles, capacity_box):
         -x['dist']
     ))
     
-    max_stops = _estimated_max_stops_per_cluster()
-    total_allowed_stops = n_vehicles * max_stops
+    # We provide a generous upper limit per truck (32 stops) to ensure the 
+    # fleet isn't artificially starved of orders. OR-Tools will strictly enforce 
+    # the real 9-hour limit and drop the excess.
+    total_allowed_stops = n_vehicles * 32
     
     selected_orders = []
     unassigned = []
@@ -585,17 +623,17 @@ def solve_all_scenarios(orders, route_date):
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
-            # 1. Prune the bad lateral outliers, but keep the exact stops that fit inside the fleet limit
+            # 1. Prune the bad lateral outliers before solving
             selected_orders, pre_backlog = select_smart_orders(orders, n, VEHICLE_CAPACITY_BOX)
             
             # 2. Build matrices ONLY for the selected orders
             locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + selected_orders
             dist_km, time_min = build_distance_time_matrices(locations)
             
-            # 3. Solve all vehicles AT THE SAME TIME to allow Google OR-Tools to balance route Time natively
+            # 3. Solve all vehicles AT THE SAME TIME to allow Google OR-Tools to load balance
             routes, solver_backlog, summary = solve_routing(selected_orders, route_date, n, dist_km, time_min)
             
-            # Combine the manual backlog with any nodes OR-Tools had to drop
+            # Combine the pre-filtered backlog with any extra nodes OR-Tools had to drop
             final_backlog = pre_backlog + solver_backlog
             
             print(f"  Served {sum(row[2] for row in summary)}/{len(orders)}, backlog {len(final_backlog)}, dist {sum(row[4] for row in summary):.1f}km")
