@@ -2,14 +2,14 @@
 Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
-vehicles subject to strict 9-hour time limits, and outputs the plan to Sheets.
+3 vehicles subject to strict 9-hour time limits.
 
 Routing Strategy:
 1. Protects H+3 SLAs (Tier 1 Critical Priority).
-2. Uses PCA math to identify the delivery corridor and drop lateral outliers (Far East/West).
-3. Keeps Depth (Deep South) to clear distant edges and prevent repeat empty trips.
-4. Trusts Google OR-Tools natively to balance route Time across all vehicles.
-5. Uses Native OR-Tools Sequencing for smooth, non-overlapping circular routes.
+2. Uses PCA math to drop lateral outliers (Far East/West) to save fuel.
+3. Keeps Depth (Deep South) to clear distant regions and prevent repeat empty trips.
+4. Uses SAVINGS heuristic to build beautiful non-overlapping petal routes.
+5. Uses GlobalSpanCost to perfectly balance driver time workloads.
 """
 
 import os
@@ -247,8 +247,7 @@ def _upsert_sheet_by_date(spreadsheet, sheet_name, header, new_rows, route_date,
     existing_header, existing_rows = _read_sheet_rows(spreadsheet, sheet_name)
 
     if existing_header and existing_header != header:
-        print(f"[{sheet_name}] WARNING: existing header doesn't match the current schema - "
-              f"rebuilding this sheet from scratch (its prior history will be lost this one time).")
+        print(f"[{sheet_name}] WARNING: existing header doesn't match the current schema - rebuilding.")
         existing_rows = []
 
     kept_rows = [row for row in existing_rows if len(row) == 0 or row[0] != route_date]
@@ -287,8 +286,6 @@ def build_geometry_rows(route_date, routes):
         geometry = fetch_route_geometry(DEPOT_LAT, DEPOT_LNG, stops_sorted)
         if geometry:
             geometry_rows.append([route_date, vehicle, json.dumps(geometry)])
-        else:
-            print(f"  [geometry] no geometry captured for {vehicle} - dashboard will use a straight line for it")
     return geometry_rows
 
 
@@ -365,18 +362,15 @@ OSRM_DEMO_MAX_POINTS = 100
 
 def build_osrm_demo_matrices(locations):
     if len(locations) > OSRM_DEMO_MAX_POINTS:
-        raise RuntimeError(f"{len(locations)} points exceeds the demo server's practical "
-                            f"~{OSRM_DEMO_MAX_POINTS}-point limit for one table query.")
-
+        raise RuntimeError(f"{len(locations)} points exceeds demo limit.")
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
     url = OSRM_DEMO_URL + coords
-
-    print(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from the public demo server...")
+    
+    print(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from public demo...")
     response = requests.get(url, params={"annotations": "distance,duration"}, timeout=30,
                             headers={"User-Agent": "auto-routing-vrp/1.0"})
     response.raise_for_status()
     data = response.json()
-
     if data.get("code") != "Ok":
         raise RuntimeError(f"OSRM demo server returned: {data.get('code')} - {data.get('message', '')}")
 
@@ -417,14 +411,14 @@ def build_distance_time_matrices(locations):
         DISTANCE_SOURCES_USED.add("Local OSRM")
         return dist_km, _apply_traffic_buffer(time_min)
     except Exception as e:
-        print(f"[OSRM] Local routing server failed ({e}); trying the public OSRM demo server next.")
+        print(f"[OSRM] Local routing failed ({e}); trying public demo.")
 
     try:
         dist_km, time_min = build_osrm_demo_matrices(locations)
         DISTANCE_SOURCES_USED.add("Public OSRM demo")
         return dist_km, _apply_traffic_buffer(time_min)
     except Exception as e:
-        print(f"[OSRM-demo] Also failed ({e}); falling back to straight-line distance.")
+        print(f"[OSRM-demo] Failed ({e}); falling back to straight-line.")
 
     DISTANCE_SOURCES_USED.add("Straight-line (all OSRM sources failed)")
     dist_km, time_min = build_haversine_matrices(locations)
@@ -447,8 +441,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     dist_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(dist_idx)
 
-    # NATIVE LOAD BALANCING
-    # This prevents the AI from assigning 10 hours to one driver and 6 hours to another
+    # 1. ENFORCE TIME DIMENSION WITH GLOBAL SPAN (BALANCING)
     time_idx = routing.RegisterTransitCallback(time_cb)
     routing.AddDimension(time_idx, 0, EFFECTIVE_SHIFT_MINUTES, True, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
@@ -464,7 +457,8 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
         routing.AddDisjunction([manager.NodeToIndex(idx)], penalty)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    # 2. USE SAVINGS ALGORITHM TO BUILD PERFECT PETAL ROUTES (NO SPAGHETTI)
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.SAVINGS
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     params.time_limit.FromSeconds(SOLVE_TIME_LIMIT_SECONDS)
 
@@ -473,7 +467,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 
     routes, visited, summary = [], set(), []
     
-    # Extract the sequence perfectly as OR-Tools optimized it. Zero greedy resequencing.
+    # 3. DIRECT SEQUENCE EXTRACTION (No Greedy Resequencing)
     for v_id in range(num_vehicles):
         idx = routing.Start(v_id)
         node_order = []
@@ -536,10 +530,6 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 # PRE-FILTERING (SMART OUTLIER DROPPING)
 # ==========================================
 def _calculate_lateral_distances(orders):
-    """
-    Pure Python PCA approximation. Finds the main North-South delivery 
-    corridor and flags orders that stray too far East or West.
-    """
     n = len(orders)
     if n < 2: return [0]*n
         
@@ -574,10 +564,6 @@ def _calculate_lateral_distances(orders):
     return lateral_dists
 
 def select_smart_orders(orders, n_vehicles, capacity_box):
-    """
-    Filters out the bad lateral outliers, keeps the Deep South depth, 
-    and passes a generous pool of orders directly into OR-Tools.
-    """
     if not orders or n_vehicles <= 0:
         return [], list(orders)
 
@@ -595,9 +581,6 @@ def select_smart_orders(orders, n_vehicles, capacity_box):
         -x['dist']
     ))
     
-    # We provide a generous upper limit per truck (32 stops) to ensure the 
-    # fleet isn't artificially starved of orders. OR-Tools will strictly enforce 
-    # the real 9-hour limit and drop the excess.
     total_allowed_stops = n_vehicles * 32
     
     selected_orders = []
@@ -623,17 +606,12 @@ def solve_all_scenarios(orders, route_date):
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
-            # 1. Prune the bad lateral outliers before solving
             selected_orders, pre_backlog = select_smart_orders(orders, n, VEHICLE_CAPACITY_BOX)
             
-            # 2. Build matrices ONLY for the selected orders
             locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + selected_orders
             dist_km, time_min = build_distance_time_matrices(locations)
             
-            # 3. Solve all vehicles AT THE SAME TIME to allow Google OR-Tools to load balance
             routes, solver_backlog, summary = solve_routing(selected_orders, route_date, n, dist_km, time_min)
-            
-            # Combine the pre-filtered backlog with any extra nodes OR-Tools had to drop
             final_backlog = pre_backlog + solver_backlog
             
             print(f"  Served {sum(row[2] for row in summary)}/{len(orders)}, backlog {len(final_backlog)}, dist {sum(row[4] for row in summary):.1f}km")
