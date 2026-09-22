@@ -2,14 +2,49 @@
 Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
-3 vehicles using Strict Territorial Partitioning (Zero Cross-Hauls), 
+3 vehicles using Strict Territorial Partitioning (Zero Cross-Hauls),
 enforces 9-hour time limits, and writes the plan to Google Sheets.
 
 Routing Strategy:
-1. Strict Geographic Zoning: Orders are partitioned into North, Center, and South territories.
-2. Independent 1-Vehicle Solves: Each truck's route is solved in isolation to prevent cross-hauls.
+1. Strict Geographic Zoning: Orders are partitioned into North, Center, and South
+   territories (by latitude band, kept contiguous), balanced by total box volume
+   rather than raw order count so trucks carry comparable loads.
+2. Independent 1-Vehicle Solves: Each truck's route is solved in isolation to
+   prevent cross-hauls. Zones for a scenario are solved in parallel threads.
 3. SLA Protection: H+3 aging POs are prioritized within each zone.
-4. Smooth Loops: OR-Tools Guided Local Search sequences each zone into clean, non-overlapping routes.
+4. Smooth Loops: OR-Tools Guided Local Search sequences each zone into clean,
+   non-overlapping routes.
+
+--------------------------------------------------------------------------
+Changes vs. the original version
+--------------------------------------------------------------------------
+- Single shared depot+orders distance/time matrix is built ONCE per run and
+  sliced per zone/scenario, instead of re-requesting OSRM once per zone per
+  scenario (was up to 6 network calls for 3 scenarios; now 1).
+- Zone solves within a scenario run in parallel (ThreadPoolExecutor) instead
+  of sequentially, cutting wall-clock time roughly in proportion to the
+  number of vehicles used.
+- Zone partitioning balances total BOX volume (not just order count) across
+  vehicles, while still respecting strict contiguous north-to-south bands.
+- Backlog reason is now inferred (capacity vs. shift-time) instead of always
+  reporting "Shift time limit exceeded".
+- UTILIZATION_FLAG_THRESHOLD config was defined but never used - vehicle
+  summary rows now actually get flagged "Low utilization" / "Unused".
+- The "no solution found" path used to return a malformed summary row
+  (wrong column count) and silently drop all orders with no reason; fixed.
+- Google service-account credentials are now passed in-memory
+  (gspread.service_account_from_dict) instead of being written to a
+  credentials.json file on disk, which was also never cleaned up if
+  authorization failed.
+- Sheet reads now retry on transient Google API errors, matching the
+  existing retry behavior on writes.
+- load_orders validates that required source columns exist and logs how
+  many rows were skipped, instead of failing silently/row-by-row.
+- OSRM_MAX_POINTS is now actually enforced.
+- traceback (imported but unused) is now used to surface a full stack
+  trace and a non-zero exit code on unhandled failures, for cron/CI use.
+- print() replaced with logging throughout.
+--------------------------------------------------------------------------
 """
 
 import os
@@ -17,13 +52,25 @@ import sys
 import json
 import math
 import time
+import logging
 import datetime
 import traceback
+import concurrent.futures
+
 import requests
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
+
+# ==========================================
+# LOGGING
+# ==========================================
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("vrp_router")
+
 
 # ==========================================
 # CONFIG
@@ -33,6 +80,14 @@ def _env_num(name, default, cast=float):
     if raw is None or str(raw).strip() == "":
         return default
     return cast(raw)
+
+
+def _env_bool(name, default):
+    raw = os.environ.get(name, "")
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "")
+
 
 DEPOT_LAT = _env_num("DEPOT_LAT", -6.238931133669451)
 DEPOT_LNG = _env_num("DEPOT_LNG", 106.53540668179242)
@@ -67,17 +122,31 @@ def service_time_minutes(box_count):
     extra_boxes = box_count - (SERVICE_TIME_FREE_BOX_THRESHOLD - 1)
     return int(round(SERVICE_TIME_BASE_MINUTES + SERVICE_TIME_PER_EXTRA_BOX_MINUTES * extra_boxes))
 
-UTILIZATION_FLAG_THRESHOLD = 22
+
+UTILIZATION_FLAG_THRESHOLD = _env_num("UTILIZATION_FLAG_THRESHOLD", 22)
 AVG_SPEED_KMH_FALLBACK = 25
 
 PRIORITY_BASE_PENALTY = int(_env_num("PRIORITY_BASE_PENALTY", 10_000))
 PRIORITY_EXP_MULTIPLIER = 100
 
-SOLVE_TIME_LIMIT_SECONDS = 15
+SOLVE_TIME_LIMIT_SECONDS = int(_env_num("SOLVE_TIME_LIMIT_SECONDS", 15, cast=int))
 
 OSRM_URL = os.environ.get("OSRM_URL", "http://localhost:5000/table/v1/driving/")
 OSRM_ROUTE_URL = os.environ.get("OSRM_ROUTE_URL", "http://localhost:5000/route/v1/driving/")
-OSRM_MAX_POINTS = 5000
+OSRM_MAX_POINTS = int(_env_num("OSRM_MAX_POINTS", 5000, cast=int))
+
+OSRM_DEMO_URL = "https://router.project-osrm.org/table/v1/driving/"
+OSRM_DEMO_MAX_POINTS = 100
+
+TRAFFIC_TIME_MULTIPLIER = _env_num("TRAFFIC_TIME_MULTIPLIER", 1.5)
+
+# "box"  -> partition contiguous north-to-south bands so each zone carries a
+#           roughly equal total box volume (better truck-load balance).
+# "count"-> original behavior: split into equal-sized chunks by order count.
+ZONE_BALANCE_MODE = os.environ.get("ZONE_BALANCE_MODE", "box").strip().lower()
+
+# Solve each scenario's zones concurrently instead of one after another.
+PARALLEL_ZONE_SOLVE = _env_bool("PARALLEL_ZONE_SOLVE", True)
 
 SOURCE_SHEET = "Order_Outstanding_Cleaned"
 OUTPUT_SHEET = "Routing_Plan"
@@ -86,30 +155,36 @@ SCENARIOS_SHEET = "Routing_Scenarios"
 GEOMETRY_SHEET = "Routing_Geometry"
 VEHICLE_SUMMARY_SHEET = "Routing_VehicleSummary"
 
+REQUIRED_SOURCE_COLUMNS = [
+    "Kode Fulfillment", "Nama Penerima", "Alamat Penerima",
+    "Latitude Penerima", "Longitude Penerima", "Total Box",
+    "Tanggal Fulfillment Masuk FF",
+]
+
+
 # ==========================================
 # GOOGLE SHEETS I/O
 # ==========================================
 def get_spreadsheet():
     raw_service_account = os.environ.get("GOOGLE_SERVICE_ACCOUNT")
     if not raw_service_account:
-        print("FATAL: env var 'GOOGLE_SERVICE_ACCOUNT' is missing/empty.")
+        logger.error("FATAL: env var 'GOOGLE_SERVICE_ACCOUNT' is missing/empty.")
         sys.exit(1)
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
     if not spreadsheet_id:
-        print("FATAL: env var 'SPREADSHEET_ID' is missing/empty.")
+        logger.error("FATAL: env var 'SPREADSHEET_ID' is missing/empty.")
         sys.exit(1)
 
-    service_account_info = json.loads(raw_service_account)
-    creds_path = "credentials.json"
-    
-    with open(creds_path, "w") as f:
-        json.dump(service_account_info, f)
-    
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
-    gc = gspread.authorize(creds)
-    os.remove(creds_path)
+    try:
+        service_account_info = json.loads(raw_service_account)
+    except json.JSONDecodeError as e:
+        logger.error(f"FATAL: GOOGLE_SERVICE_ACCOUNT is not valid JSON: {e}")
+        sys.exit(1)
 
+    scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    # Credentials are handed to gspread in-memory only - nothing touches disk,
+    # so there's nothing to clean up (and nothing to leak) if auth fails.
+    gc = gspread.service_account_from_dict(service_account_info, scopes=scopes)
     return gc.open_by_key(spreadsheet_id)
 
 
@@ -123,18 +198,28 @@ def _safe_col(row, idx, col_name, default=""):
 def load_orders(spreadsheet):
     sheet = spreadsheet.worksheet(SOURCE_SHEET)
     values = sheet.get_all_values()
-    if len(values) < 2: return []
+    if len(values) < 2:
+        return []
 
     header, *data_rows = values
     idx = {name: i for i, name in enumerate(header)}
-    orders = []
 
+    missing = [c for c in REQUIRED_SOURCE_COLUMNS if c not in idx]
+    if missing:
+        raise RuntimeError(
+            f"Source sheet '{SOURCE_SHEET}' is missing required column(s): {missing}"
+        )
+
+    orders = []
+    skipped = 0
     for row in data_rows:
         try:
             lat = float(row[idx["Latitude Penerima"]])
             lng = float(row[idx["Longitude Penerima"]])
             box = max(0.0, float(row[idx["Total Box"]] or 0))
-            if lat == 0 or lng == 0: continue
+            if lat == 0 or lng == 0:
+                skipped += 1
+                continue
 
             orders.append({
                 "kode_fulfillment": row[idx["Kode Fulfillment"]],
@@ -148,16 +233,24 @@ def load_orders(spreadsheet):
                 "jumlah_bku": _safe_col(row, idx, "Jumlah BKU", box),
             })
         except (ValueError, IndexError):
+            skipped += 1
             continue
+
+    if skipped:
+        logger.warning(
+            f"[{SOURCE_SHEET}] skipped {skipped} row(s) with missing/invalid lat, lng, or box values."
+        )
     return orders
 
 
 def parse_date_flexible(value):
-    if not value: return None
+    if not value:
+        return None
     for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.datetime.strptime(str(value).strip(), fmt).date()
-        except ValueError: continue
+        except ValueError:
+            continue
     return None
 
 
@@ -181,7 +274,7 @@ def write_routing_output(spreadsheet, route_date, scenarios, total_orders=0, com
             "Box (this stop)", "Cumulative Box", "ETA", "ETD",
             "Distance from Prev (km)", "Tanggal Fulfillment Masuk FF",
             "Nomor AWB", "Jam Fulfillment Masuk FF", "Jumlah BKU",
-            "Age (Days)", 
+            "Age (Days)",
         ], [
             [route_date, r["vehicle"], r["driver"], r["nopol"], r["seq"], r["kode_fulfillment"],
              r["nama_penerima"], r["alamat_penerima"], r["kabupaten_kota"], r["lat"], r["lng"],
@@ -232,22 +325,31 @@ def write_routing_output(spreadsheet, route_date, scenarios, total_orders=0, com
     ], comparison_rows, route_date)
 
 
-def _read_sheet_rows(spreadsheet, sheet_name):
+def _read_sheet_rows(spreadsheet, sheet_name, max_retries=4):
     try:
         worksheet = spreadsheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
         return None, []
-    values = worksheet.get_all_values()
-    if not values:
-        return None, []
-    return values[0], values[1:]
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            values = worksheet.get_all_values()
+            if not values:
+                return None, []
+            return values[0], values[1:]
+        except gspread.exceptions.APIError as e:
+            logger.warning(f"[{sheet_name}] read attempt {attempt}/{max_retries} failed: {e}")
+            time.sleep(3 * (2 ** (attempt - 1)))
+
+    logger.error(f"[{sheet_name}] failed to read after {max_retries} attempts; treating as empty.")
+    return None, []
 
 
 def _upsert_sheet_by_date(spreadsheet, sheet_name, header, new_rows, route_date, max_retries=4):
-    existing_header, existing_rows = _read_sheet_rows(spreadsheet, sheet_name)
+    existing_header, existing_rows = _read_sheet_rows(spreadsheet, sheet_name, max_retries=max_retries)
 
     if existing_header and existing_header != header:
-        print(f"[{sheet_name}] WARNING: existing header doesn't match current schema - rebuilding.")
+        logger.warning(f"[{sheet_name}] existing header doesn't match current schema - rebuilding.")
         existing_rows = []
 
     kept_rows = [row for row in existing_rows if len(row) == 0 or row[0] != route_date]
@@ -271,7 +373,7 @@ def fetch_route_geometry(depot_lat, depot_lng, stops):
         coords_geojson = data["routes"][0]["geometry"]["coordinates"]
         return [[c[1], c[0]] for c in coords_geojson]
     except Exception as e:
-        print(f"  [geometry] OSRM route call failed: {e}")
+        logger.warning(f"[geometry] OSRM route call failed: {e}")
         return None
 
 
@@ -298,11 +400,15 @@ def _write_sheet(spreadsheet, sheet_name, header, rows, max_retries=4):
     for attempt in range(1, max_retries + 1):
         try:
             worksheet.clear()
-            if rows or header: worksheet.update(range_name="A1", values=[header] + rows)
-            print(f"[{sheet_name}] wrote {len(rows)} row(s).")
+            if rows or header:
+                worksheet.update(range_name="A1", values=[header] + rows)
+            logger.info(f"[{sheet_name}] wrote {len(rows)} row(s).")
             return True
         except gspread.exceptions.APIError as e:
+            logger.warning(f"[{sheet_name}] write attempt {attempt}/{max_retries} failed: {e}")
             time.sleep(3 * (2 ** (attempt - 1)))
+
+    logger.error(f"[{sheet_name}] failed to write after {max_retries} attempts.")
     return False
 
 
@@ -333,8 +439,8 @@ def build_haversine_matrices(locations):
 def build_osrm_local_matrices(locations):
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
     url = OSRM_URL + coords
-    
-    print(f"[OSRM] Requesting {len(locations)}x{len(locations)} matrix from localhost...")
+
+    logger.info(f"[OSRM] Requesting {len(locations)}x{len(locations)} matrix from localhost...")
     response = requests.get(url, params={"annotations": "distance,duration"}, timeout=30)
     response.raise_for_status()
     data = response.json()
@@ -342,7 +448,7 @@ def build_osrm_local_matrices(locations):
     distances_m, durations_s = data["distances"], data["durations"]
     n = len(locations)
     dist_km, time_min = [[0.0] * n for _ in range(n)], [[0.0] * n for _ in range(n)]
-    
+
     for i in range(n):
         for j in range(n):
             if i != j:
@@ -357,19 +463,16 @@ def build_osrm_local_matrices(locations):
     return dist_km, time_min
 
 
-OSRM_DEMO_URL = "https://router.project-osrm.org/table/v1/driving/"
-OSRM_DEMO_MAX_POINTS = 100
-
 def build_osrm_demo_matrices(locations):
     if len(locations) > OSRM_DEMO_MAX_POINTS:
         raise RuntimeError(f"{len(locations)} points exceeds demo limit.")
-    
+
     coords = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
     url = OSRM_DEMO_URL + coords
-    
-    print(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from public demo...")
+
+    logger.info(f"[OSRM-demo] Requesting {len(locations)}x{len(locations)} matrix from public demo...")
     response = requests.get(url, params={"annotations": "distance,duration"}, timeout=30,
-                            headers={"User-Agent": "auto-routing-vrp/1.0"})
+                             headers={"User-Agent": "auto-routing-vrp/1.0"})
     response.raise_for_status()
     data = response.json()
 
@@ -394,13 +497,13 @@ def build_osrm_demo_matrices(locations):
     return dist_km, time_min
 
 
-TRAFFIC_TIME_MULTIPLIER = _env_num("TRAFFIC_TIME_MULTIPLIER", 1.5)
-
 def _apply_traffic_buffer(time_min):
     n = len(time_min)
     return [[time_min[i][j] * TRAFFIC_TIME_MULTIPLIER for j in range(n)] for i in range(n)]
 
+
 DISTANCE_SOURCES_USED = set()
+
 
 def build_distance_time_matrices(locations):
     if os.environ.get("SKIP_OSM"):
@@ -408,41 +511,129 @@ def build_distance_time_matrices(locations):
         dist_km, time_min = build_haversine_matrices(locations)
         return dist_km, _apply_traffic_buffer(time_min)
 
-    try:
-        dist_km, time_min = build_osrm_local_matrices(locations)
-        DISTANCE_SOURCES_USED.add("Local OSRM")
-        return dist_km, _apply_traffic_buffer(time_min)
-    except Exception as e:
-        print(f"[OSRM] Local routing failed ({e}); trying public demo.")
+    if len(locations) <= OSRM_MAX_POINTS:
+        try:
+            dist_km, time_min = build_osrm_local_matrices(locations)
+            DISTANCE_SOURCES_USED.add("Local OSRM")
+            return dist_km, _apply_traffic_buffer(time_min)
+        except Exception as e:
+            logger.warning(f"[OSRM] Local routing failed ({e}); trying public demo.")
+    else:
+        logger.warning(
+            f"{len(locations)} points exceeds OSRM_MAX_POINTS ({OSRM_MAX_POINTS}); skipping local OSRM."
+        )
 
     try:
         dist_km, time_min = build_osrm_demo_matrices(locations)
         DISTANCE_SOURCES_USED.add("Public OSRM demo")
         return dist_km, _apply_traffic_buffer(time_min)
     except Exception as e:
-        print(f"[OSRM-demo] Failed ({e}); falling back to straight-line.")
+        logger.warning(f"[OSRM-demo] Failed ({e}); falling back to straight-line.")
 
     DISTANCE_SOURCES_USED.add("Straight-line (all OSRM sources failed)")
     dist_km, time_min = build_haversine_matrices(locations)
     return dist_km, _apply_traffic_buffer(time_min)
 
 
-def solve_zone_routing(zone_orders, route_date, dist_km, time_min):
+def build_global_matrices(depot_lat, depot_lng, orders):
+    """Build the depot + all-orders distance/time matrix exactly once per run.
+    Zone-level matrices for every scenario are sliced out of this instead of
+    each triggering their own OSRM request."""
+    locations = [{"lat": depot_lat, "lng": depot_lng}] + [
+        {"lat": o["lat"], "lng": o["lng"]} for o in orders
+    ]
+    return build_distance_time_matrices(locations)
+
+
+def slice_matrix(dist_km_full, time_min_full, global_indices):
+    """Pull out the depot + a subset of orders (by their index into the
+    original `orders` list) from the full matrix, preserving the order of
+    `global_indices` so row/col i+1 matches global_indices[i]."""
+    idxs = [0] + [g + 1 for g in global_indices]
+    zdist = [[dist_km_full[a][b] for b in idxs] for a in idxs]
+    ztime = [[time_min_full[a][b] for b in idxs] for a in idxs]
+    return zdist, ztime
+
+
+def partition_zones_by_count(orders_sorted, n):
+    chunk_size = math.ceil(len(orders_sorted) / n)
+    zones = []
+    for i in range(n):
+        chunk = orders_sorted[i * chunk_size: (i + 1) * chunk_size]
+        if chunk:
+            zones.append(chunk)
+    return zones
+
+
+def partition_zones_by_box(orders_sorted, n):
+    """Same contiguous north-to-south ordering as partition_zones_by_count,
+    but each cut point is chosen so every zone carries roughly 1/n of the
+    total box volume rather than 1/n of the order count. This keeps the
+    'strict territorial, zero cross-haul' property while balancing truck
+    load much better when order sizes vary a lot."""
+    total_box = sum(o.get("box", 0) for o in orders_sorted)
+    if total_box <= 0 or n <= 1:
+        return partition_zones_by_count(orders_sorted, n)
+
+    target = total_box / n
+    zones = [[] for _ in range(n)]
+    zone_idx = 0
+    running = 0.0
+    for o in orders_sorted:
+        zones[zone_idx].append(o)
+        running += o.get("box", 0)
+        if running >= target and zone_idx < n - 1:
+            zone_idx += 1
+            running = 0.0
+    return [z for z in zones if z]
+
+
+def _classify_backlog_reason(box_used_before, order_box, capacity):
+    if box_used_before + order_box > capacity:
+        return "Vehicle capacity exceeded"
+    return "Shift time limit exceeded (9 hours)"
+
+
+def _split_unroutable_by_capacity(orders):
+    """Orders whose box count alone exceeds a single vehicle's capacity can
+    never be routed by any scenario, no matter how zones are balanced. Pulling
+    them out up front does two things: it reports them with a correct reason
+    immediately (rather than relying on the solver to drop them), and it stops
+    a single huge outlier order from skewing box-balanced zone partitioning
+    for every other (actually deliverable) order in that zone."""
+    routable, unroutable = [], []
+    for o in orders:
+        if o.get("box", 0) > VEHICLE_CAPACITY_BOX:
+            unroutable.append({**o, "backlog_reason": "Vehicle capacity exceeded"})
+        else:
+            routable.append(o)
+    return routable, unroutable
+
+
+def solve_zone_routing(zone_orders, dist_km, time_min):
     """
     Solves a single isolated geographic zone as a 1-vehicle VRP.
     Guarantees zero cross-hauls between vehicles.
+    dist_km / time_min must already be sized (1 + len(zone_orders)) and
+    aligned so index 0 = depot, index i+1 = zone_orders[i].
     """
     locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + zone_orders
     manager = pywrapcp.RoutingIndexManager(len(locations), 1, 0)
     routing = pywrapcp.RoutingModel(manager)
 
-    def dist_cb(f, t): return int(round(dist_km[manager.IndexToNode(f)][manager.IndexToNode(t)] * 1000))
+    def dist_cb(f, t):
+        return int(round(dist_km[manager.IndexToNode(f)][manager.IndexToNode(t)] * 1000))
+
     def time_cb(f, t):
         i, j = manager.IndexToNode(f), manager.IndexToNode(t)
         service = service_time_minutes(locations[i].get("box", 0)) if i != 0 else 0
         return int(round(time_min[i][j] + service))
-    def load_cb(f): return int(round(locations[manager.IndexToNode(f)].get("box", 0)))
-    def stop_cb(f): return 0 if manager.IndexToNode(f) == 0 else 1
+
+    def load_cb(f):
+        return int(round(locations[manager.IndexToNode(f)].get("box", 0)))
+
+    def stop_cb(f):
+        return 0 if manager.IndexToNode(f) == 0 else 1
 
     dist_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(dist_idx)
@@ -467,8 +658,13 @@ def solve_zone_routing(zone_orders, route_date, dist_km, time_min):
 
     solution = routing.SolveWithParameters(params)
     if not solution:
-        # Fallback if solver struggles: return all orders as backlog
-        return [], zone_orders, []
+        # Solver couldn't produce anything at all: everything goes to backlog,
+        # and the summary row must still match the 6-element shape the
+        # caller expects ([seq, box, dist, time, utilization%, flag]).
+        backlog = [
+            {**o, "backlog_reason": "No solution found for zone"} for o in zone_orders
+        ]
+        return [], backlog, [0, 0, 0.0, 0, 0.0, "No solution found"]
 
     idx = routing.Start(0)
     node_order = []
@@ -489,11 +685,11 @@ def solve_zone_routing(zone_orders, route_date, dist_km, time_min):
         box += order_obj.get("box", 0)
         leg_dist = dist_km[prev][node]
         dist += leg_dist
-        
+
         prev_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
         arr_min = arr_min + prev_service_min + time_min[prev][node]
         stop_service_min = service_time_minutes(order_obj.get("box", 0))
-        
+
         v_route.append({
             "seq": seq,
             "kode_fulfillment": order_obj["kode_fulfillment"],
@@ -517,93 +713,137 @@ def solve_zone_routing(zone_orders, route_date, dist_km, time_min):
     actual_return_time_min = time_min[prev][0] if prev != 0 else 0
     total_time_min = arr_min + final_service_min + actual_return_time_min
 
-    backlog = [{**zone_orders[idx], "backlog_reason": "Shift time limit exceeded (9 hours)"} for idx in range(len(zone_orders)) if idx not in visited]
-    
-    summary = [seq, box, round(dist, 2), round(total_time_min), round(100.0 * box / VEHICLE_CAPACITY_BOX, 1), ""]
+    backlog = [
+        {**zone_orders[idx], "backlog_reason": _classify_backlog_reason(box, zone_orders[idx].get("box", 0), VEHICLE_CAPACITY_BOX)}
+        for idx in range(len(zone_orders)) if idx not in visited
+    ]
+
+    utilization_pct = round(100.0 * box / VEHICLE_CAPACITY_BOX, 1) if VEHICLE_CAPACITY_BOX else 0.0
+    if seq == 0:
+        flag = "Unused"
+    elif utilization_pct < UTILIZATION_FLAG_THRESHOLD:
+        flag = "Low utilization"
+    else:
+        flag = ""
+
+    summary = [seq, box, round(dist, 2), round(total_time_min), utilization_pct, flag]
     return v_route, backlog, summary
 
 
-def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
+def solve_clustered_scenario(orders, n, dist_km_full, time_min_full):
     """
     Strict Territorial Partitioning:
-    Splits orders into N geographic zones (North to South) and solves each independently.
+    Splits orders into N geographic zones (North to South) and solves each
+    independently, in parallel when PARALLEL_ZONE_SOLVE is enabled.
     """
     if not orders:
         return [], [], []
 
-    # Sort all orders by Latitude (North to South)
-    orders_sorted_lat = sorted(orders, key=lambda x: x['lat'], reverse=True)
-    
-    # Partition into n equal chunks
-    chunk_size = math.ceil(len(orders_sorted_lat) / n)
-    zones = []
-    for i in range(n):
-        chunk = orders_sorted_lat[i * chunk_size : (i + 1) * chunk_size]
-        if chunk:
-            zones.append(chunk)
+    routable_orders, unroutable_backlog = _split_unroutable_by_capacity(orders)
+    if unroutable_backlog:
+        logger.warning(
+            f"{len(unroutable_backlog)} order(s) exceed vehicle capacity alone "
+            "and can never be routed; backlogged upfront."
+        )
+    if not routable_orders:
+        return [], unroutable_backlog, []
 
-    all_routes, all_backlog, all_summary = [], [], []
+    orders_sorted_lat = sorted(routable_orders, key=lambda x: x["lat"], reverse=True)
+    if ZONE_BALANCE_MODE == "box":
+        zones = partition_zones_by_box(orders_sorted_lat, n)
+    else:
+        zones = partition_zones_by_count(orders_sorted_lat, n)
 
+    tasks = []
     for zone_idx, zone_orders in enumerate(zones):
         if zone_idx >= NUM_VEHICLES:
-            # If scenario uses fewer vehicles than zones, fold remaining into last vehicle
-            zones[-1].extend(zone_orders)
+            # Should not happen since zones is built with at most n <=
+            # NUM_VEHICLES entries, but fold any overflow safely rather
+            # than dropping orders.
+            logger.warning("More zones than vehicles available; merging overflow into last vehicle's zone.")
+            zones[NUM_VEHICLES - 1].extend(zone_orders)
             continue
+        tasks.append((zone_idx, zone_orders, VEHICLES[zone_idx]))
 
-        vehicle = VEHICLES[zone_idx]
+    def _solve_one(zone_orders, vehicle):
         if not zone_orders:
-            all_summary.append([vehicle["name"], vehicle["driver"], 0, 0, 0.0, 0, 0, ""])
-            continue
-
-        # Build distance & time matrices for this specific zone only
-        locations = [{"lat": depot_lat, "lng": depot_lng}] + zone_orders
-        dist_km, time_min = build_distance_time_matrices(locations)
-
-        v_route, backlog, summary = solve_zone_routing(zone_orders, route_date, dist_km, time_min)
-
+            return vehicle, [], [], [0, 0, 0.0, 0, 0.0, "Unused"]
+        global_indices = [o["_gidx"] for o in zone_orders]
+        zdist, ztime = slice_matrix(dist_km_full, time_min_full, global_indices)
+        v_route, backlog, summary = solve_zone_routing(zone_orders, zdist, ztime)
         for r in v_route:
             r["vehicle"] = vehicle["name"]
             r["driver"] = vehicle["driver"]
             r["nopol"] = vehicle.get("nopol", "")
+        return vehicle, v_route, backlog, summary
 
+    results_by_idx = {}
+    if PARALLEL_ZONE_SOLVE and len(tasks) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+            future_map = {ex.submit(_solve_one, zo, veh): idx for idx, zo, veh in tasks}
+            for fut in concurrent.futures.as_completed(future_map):
+                results_by_idx[future_map[fut]] = fut.result()
+    else:
+        for idx, zo, veh in tasks:
+            results_by_idx[idx] = _solve_one(zo, veh)
+
+    all_routes, all_backlog, all_summary = [], [], []
+    for idx in sorted(results_by_idx):
+        vehicle, v_route, backlog, summary = results_by_idx[idx]
         all_routes.extend(v_route)
         all_backlog.extend(backlog)
         all_summary.append([vehicle["name"], vehicle["driver"]] + summary)
 
-    return all_routes, all_backlog, all_summary
+    return all_routes, unroutable_backlog + all_backlog, all_summary
 
 
-def solve_all_scenarios(orders, route_date):
+def solve_all_scenarios(orders, dist_km_full, time_min_full):
     scenarios = {}
     for n in range(1, NUM_VEHICLES + 1):
-        print(f"\n--- Scenario: {n} vehicle(s) ---")
+        logger.info(f"--- Scenario: {n} vehicle(s) ---")
         try:
-            routes, backlog, summary = solve_clustered_scenario(orders, route_date, n, DEPOT_LAT, DEPOT_LNG)
-            print(f"  Served {sum(row[2] for row in summary)}/{len(orders)}, backlog {len(backlog)}, dist {sum(row[4] for row in summary):.1f}km")
+            routes, backlog, summary = solve_clustered_scenario(orders, n, dist_km_full, time_min_full)
+            served = sum(row[2] for row in summary)
+            dist_total = sum(row[4] for row in summary)
+            logger.info(f"  Served {served}/{len(orders)}, backlog {len(backlog)}, dist {dist_total:.1f}km")
             scenarios[n] = {"routes": routes, "backlog": backlog, "summary": summary}
         except Exception as e:
-            print(f"  Failed: {e}")
+            logger.exception(f"  Scenario {n} failed")
             scenarios[n] = {"error": str(e)}
     return scenarios
 
 
 def main():
     route_date_str = os.environ.get("ROUTE_DATE", "").strip()
-    route_date = datetime.datetime.strptime(route_date_str, "%Y-%m-%d").date() if route_date_str else datetime.date.today() + datetime.timedelta(days=1)
-    
-    print(f"Routing for date: {route_date.isoformat()}")
+    route_date = (
+        datetime.datetime.strptime(route_date_str, "%Y-%m-%d").date()
+        if route_date_str else datetime.date.today() + datetime.timedelta(days=1)
+    )
+
+    logger.info(f"Routing for date: {route_date.isoformat()}")
     spreadsheet = get_spreadsheet()
     orders = load_orders(spreadsheet)
-    if not orders: return print("No orders to route.")
+    if not orders:
+        logger.info("No orders to route.")
+        return
 
-    for o in orders:
+    for i, o in enumerate(orders):
+        o["_gidx"] = i
         order_date = parse_date_flexible(o.get("tanggal_masuk"))
         o["age"] = max(0, (route_date - order_date).days) if order_date else 0
 
-    scenarios = solve_all_scenarios(orders, route_date)
+    logger.info(f"Building distance/time matrix for depot + {len(orders)} orders...")
+    dist_km_full, time_min_full = build_global_matrices(DEPOT_LAT, DEPOT_LNG, orders)
+
+    scenarios = solve_all_scenarios(orders, dist_km_full, time_min_full)
     computed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     write_routing_output(spreadsheet, route_date.strftime("%d/%m/%Y"), scenarios,
                           total_orders=len(orders), computed_at=computed_at)
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.error("Unhandled exception in main():\n" + traceback.format_exc())
+        sys.exit(1)
