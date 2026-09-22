@@ -2,7 +2,7 @@
 Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
-3 vehicles subject to strict 9-hour time limits, and writes the plan to Sheets.
+3 vehicles subject to strict 9-hour time limits, and writes the plan to Google Sheets.
 
 Routing Strategy:
 1. Protects H+3 SLAs (Tier 1 Critical Priority).
@@ -446,7 +446,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     time_idx = routing.RegisterTransitCallback(time_cb)
     routing.AddDimension(time_idx, 0, EFFECTIVE_SHIFT_MINUTES, True, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
-    time_dim.SetGlobalSpanCostCoefficient(100) # Forces all 3 drivers to have roughly equal route times
+    time_dim.SetGlobalSpanCostCoefficient(100) # Forces all drivers to have roughly equal route times
 
     routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(load_cb), 0, [VEHICLE_CAPACITY_BOX] * num_vehicles, True, "Capacity")
     routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(stop_cb), 0, [len(orders)] * num_vehicles, True, "StopCount")
@@ -531,11 +531,6 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 # PRE-FILTERING (SMART OUTLIER DROPPING)
 # ==========================================
 def _calculate_lateral_distances(orders):
-    """
-    Pure Python PCA approximation.
-    Finds the main North-South delivery corridor and calculates how far 
-    East or West (Lateral Distance) each order is from that main line.
-    """
     n = len(orders)
     if n < 2: return [0]*n
         
@@ -571,10 +566,6 @@ def _calculate_lateral_distances(orders):
     return lateral_dists
 
 def select_smart_orders(orders, n_vehicles, capacity_box):
-    """
-    Explicitly drops non-critical lateral outliers unconditionally to save fuel.
-    Passes the remaining valid orders straight to OR-Tools for native balancing.
-    """
     if not orders or n_vehicles <= 0:
         return [], list(orders)
 
@@ -599,8 +590,7 @@ def select_smart_orders(orders, n_vehicles, capacity_box):
     current_fleet_boxes = 0
     
     for o in orders_sorted_by_priority:
-        # THE FIX: Explicitly and unconditionally drop non-critical outliers 
-        # BEFORE checking fleet limits, ensuring the Green Truck never "goes around the earth".
+        # EXPLICIT UNCONDITIONAL PRUNING: Drop non-critical lateral outliers immediately
         if o['is_lateral_outlier'] == 1 and o['critical'] == 0:
             o['backlog_reason'] = "Lateral Outlier (Geographic Pruning)"
             unassigned.append(o)
@@ -624,17 +614,12 @@ def solve_all_scenarios(orders, route_date):
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
-            # 1. Unconditionally drop non-critical lateral outliers
             selected_orders, pre_backlog = select_smart_orders(orders, n, VEHICLE_CAPACITY_BOX)
             
-            # 2. Build matrices ONLY for the selected orders
             locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + selected_orders
             dist_km, time_min = build_distance_time_matrices(locations)
             
-            # 3. Solve all vehicles AT THE SAME TIME
             routes, solver_backlog, summary = solve_routing(selected_orders, route_date, n, dist_km, time_min)
-            
-            # Combine the manual outlier backlog with any excess OR-Tools had to drop
             final_backlog = pre_backlog + solver_backlog
             
             print(f"  Served {sum(row[2] for row in summary)}/{len(orders)}, backlog {len(final_backlog)}, dist {sum(row[4] for row in summary):.1f}km")
