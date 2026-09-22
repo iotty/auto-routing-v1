@@ -2,13 +2,14 @@
 Daily delivery routing (VRP) solver.
 
 Reads deliverable orders from Order_Outstanding_Cleaned, assigns them to
-3 vehicles subject to strict 9-hour time limits, and writes the plan to Google Sheets.
+3 vehicles using Strict Territorial Partitioning (Zero Cross-Hauls), 
+enforces 9-hour time limits, and writes the plan to Google Sheets.
 
 Routing Strategy:
-1. Protects H+3 SLAs (Tier 1 Critical Priority).
-2. Uses PCA math to unconditionally drop non-critical lateral outliers (Far East/West).
-3. Trusts Google OR-Tools natively to balance route Time across all vehicles.
-4. Uses Native OR-Tools SAVINGS heuristic for smooth, circular, non-overlapping routes.
+1. Strict Geographic Zoning: Orders are partitioned into North, Center, and South territories.
+2. Independent 1-Vehicle Solves: Each truck's route is solved in isolation to prevent cross-hauls.
+3. SLA Protection: H+3 aging POs are prioritized within each zone.
+4. Smooth Loops: OR-Tools Guided Local Search sequences each zone into clean, non-overlapping routes.
 """
 
 import os
@@ -246,7 +247,7 @@ def _upsert_sheet_by_date(spreadsheet, sheet_name, header, new_rows, route_date,
     existing_header, existing_rows = _read_sheet_rows(spreadsheet, sheet_name)
 
     if existing_header and existing_header != header:
-        print(f"[{sheet_name}] WARNING: existing header doesn't match the current schema - rebuilding.")
+        print(f"[{sheet_name}] WARNING: existing header doesn't match current schema - rebuilding.")
         existing_rows = []
 
     kept_rows = [row for row in existing_rows if len(row) == 0 or row[0] != route_date]
@@ -426,9 +427,13 @@ def build_distance_time_matrices(locations):
     return dist_km, _apply_traffic_buffer(time_min)
 
 
-def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
-    locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + orders
-    manager = pywrapcp.RoutingIndexManager(len(locations), num_vehicles, 0)
+def solve_zone_routing(zone_orders, route_date, dist_km, time_min):
+    """
+    Solves a single isolated geographic zone as a 1-vehicle VRP.
+    Guarantees zero cross-hauls between vehicles.
+    """
+    locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + zone_orders
+    manager = pywrapcp.RoutingIndexManager(len(locations), 1, 0)
     routing = pywrapcp.RoutingModel(manager)
 
     def dist_cb(f, t): return int(round(dist_km[manager.IndexToNode(f)][manager.IndexToNode(t)] * 1000))
@@ -442,15 +447,13 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
     dist_idx = routing.RegisterTransitCallback(dist_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(dist_idx)
 
-    # 1. ENFORCE TIME BALANCING
     time_idx = routing.RegisterTransitCallback(time_cb)
     routing.AddDimension(time_idx, 0, EFFECTIVE_SHIFT_MINUTES, True, "Time")
-    time_dim = routing.GetDimensionOrDie("Time")
-    time_dim.SetGlobalSpanCostCoefficient(100) # Forces all drivers to have roughly equal route times
 
-    routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(load_cb), 0, [VEHICLE_CAPACITY_BOX] * num_vehicles, True, "Capacity")
-    routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(stop_cb), 0, [len(orders)] * num_vehicles, True, "StopCount")
+    routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(load_cb), 0, [VEHICLE_CAPACITY_BOX], True, "Capacity")
+    routing.AddDimensionWithVehicleCapacity(routing.RegisterUnaryTransitCallback(stop_cb), 0, [len(zone_orders)], True, "StopCount")
 
+    # Prioritize aging POs (H+3 gets massive penalty if dropped)
     for idx in range(1, len(locations)):
         age = locations[idx].get("age", 0)
         safe_age = min(age, 4)
@@ -458,155 +461,116 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
         routing.AddDisjunction([manager.NodeToIndex(idx)], penalty)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
-    # 2. USE SAVINGS ALGORITHM TO BUILD PERFECT PETAL ROUTES
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.SAVINGS
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     params.time_limit.FromSeconds(SOLVE_TIME_LIMIT_SECONDS)
 
     solution = routing.SolveWithParameters(params)
-    if not solution: raise RuntimeError(f"No solution found for {num_vehicles} vehicles.")
+    if not solution:
+        # Fallback if solver struggles: return all orders as backlog
+        return [], zone_orders, []
 
-    routes, visited, summary = [], set(), []
-    
-    # 3. DIRECT SEQUENCE EXTRACTION (No custom resequencing)
-    for v_id in range(num_vehicles):
-        idx = routing.Start(v_id)
-        node_order = []
-        while not routing.IsEnd(idx):
-            node = manager.IndexToNode(idx)
-            if node != 0:
-                node_order.append(node)
-            idx = solution.Value(routing.NextVar(idx))
+    idx = routing.Start(0)
+    node_order = []
+    visited = set()
+    while not routing.IsEnd(idx):
+        node = manager.IndexToNode(idx)
+        if node != 0:
+            node_order.append(node)
+            visited.add(node - 1)
+        idx = solution.Value(routing.NextVar(idx))
 
-        seq = box = dist = arr_min = 0
-        prev = 0
-        v_route = []
-        for node in node_order:
-            seq += 1; visited.add(node)
-            box += locations[node].get("box", 0)
-            leg_dist = dist_km[prev][node]
-            dist += leg_dist
-            
-            prev_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
-            arr_min = arr_min + prev_service_min + time_min[prev][node]
-            stop_service_min = service_time_minutes(locations[node].get("box", 0))
-            
-            v_route.append({
-                "vehicle": VEHICLES[v_id]["name"], "driver": VEHICLES[v_id]["driver"],
-                "nopol": VEHICLES[v_id].get("nopol", ""), "seq": seq,
-                "kode_fulfillment": locations[node]["kode_fulfillment"],
-                "nama_penerima": locations[node]["nama_penerima"],
-                "alamat_penerima": locations[node]["alamat_penerima"],
-                "lat": locations[node]["lat"], "lng": locations[node]["lng"],
-                "box": locations[node].get("box", 0), "cumulative_box": box,
-                "eta": f"{(SHIFT_START_HOUR * 60 + round(arr_min)) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + round(arr_min)) % 60:02.0f}",
-                "etd": f"{(SHIFT_START_HOUR * 60 + round(arr_min) + stop_service_min) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + round(arr_min) + stop_service_min) % 60:02.0f}",
-                "distance_from_prev_km": leg_dist, "tanggal_masuk": locations[node]["tanggal_masuk"],
-                "nomor_awb": locations[node].get("nomor_awb", ""),
-                "kabupaten_kota": locations[node].get("kabupaten_kota", ""),
-                "jam_masuk": locations[node].get("jam_masuk", ""),
-                "jumlah_bku": locations[node].get("jumlah_bku", locations[node].get("box", 0)),
-                "age": locations[node].get("age", 0),
-            })
-            prev = node
-
-        final_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
-        dist += dist_km[prev][0]
-        actual_return_time_min = time_min[prev][0] if prev != 0 else 0
-        total_time_min = arr_min + final_service_min + actual_return_time_min
-
-        routes.extend(v_route)
-        summary.append([
-            VEHICLES[v_id]["name"], VEHICLES[v_id]["driver"], seq, box, round(dist, 2),
-            round(total_time_min),
-            round(100.0 * box / VEHICLE_CAPACITY_BOX, 1) if VEHICLE_CAPACITY_BOX else 0,
-            f"Consider backlogging - only {seq} stops" if 0 < seq < UTILIZATION_FLAG_THRESHOLD else ""
-        ])
-
-    backlog = [{**locations[i], "backlog_reason": "Time limit exceeded (Dropped by OR-Tools Load Balancer)"} for i in range(1, len(locations)) if i not in visited]
-    return routes, backlog, summary
-
-
-# ==========================================
-# PRE-FILTERING (SMART OUTLIER DROPPING)
-# ==========================================
-def _calculate_lateral_distances(orders):
-    n = len(orders)
-    if n < 2: return [0]*n
+    v_route = []
+    seq = box = dist = arr_min = 0
+    prev = 0
+    for node in node_order:
+        seq += 1
+        order_obj = zone_orders[node - 1]
+        box += order_obj.get("box", 0)
+        leg_dist = dist_km[prev][node]
+        dist += leg_dist
         
-    mean_lat = sum(o['lat'] for o in orders) / n
-    mean_lng = sum(o['lng'] for o in orders) / n
-    
-    cov_ll = sum((o['lat']-mean_lat)**2 for o in orders) / (n - 1) if n > 1 else 0
-    cov_gg = sum((o['lng']-mean_lng)**2 for o in orders) / (n - 1) if n > 1 else 0
-    cov_lg = sum((o['lat']-mean_lat)*(o['lng']-mean_lng) for o in orders) / (n - 1) if n > 1 else 0
-    
-    trace = cov_ll + cov_gg
-    det = cov_ll * cov_gg - cov_lg**2
-    inner = max(0, trace**2 - 4*det)
-    lambda1 = (trace + math.sqrt(inner)) / 2
+        prev_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
+        arr_min = arr_min + prev_service_min + time_min[prev][node]
+        stop_service_min = service_time_minutes(order_obj.get("box", 0))
         
-    if cov_lg != 0:
-        vec1_lat, vec1_lng = lambda1 - cov_gg, cov_lg
-    else:
-        vec1_lat, vec1_lng = 1, 0
-        
-    mag = math.hypot(vec1_lat, vec1_lng)
-    if mag == 0: vec1_lat, vec1_lng = 1, 0
-    else: vec1_lat, vec1_lng = vec1_lat/mag, vec1_lng/mag
-    
-    norm_lat, norm_lng = -vec1_lng, vec1_lat
-    
-    lateral_dists = []
-    for o in orders:
-        dx = o['lat'] - mean_lat
-        dy = o['lng'] - mean_lng
-        lateral_dists.append(abs(dx * norm_lat + dy * norm_lng))
-        
-    return lateral_dists
+        v_route.append({
+            "seq": seq,
+            "kode_fulfillment": order_obj["kode_fulfillment"],
+            "nama_penerima": order_obj["nama_penerima"],
+            "alamat_penerima": order_obj["alamat_penerima"],
+            "lat": order_obj["lat"], "lng": order_obj["lng"],
+            "box": order_obj.get("box", 0), "cumulative_box": box,
+            "eta": f"{(SHIFT_START_HOUR * 60 + round(arr_min)) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + round(arr_min)) % 60:02.0f}",
+            "etd": f"{(SHIFT_START_HOUR * 60 + round(arr_min) + stop_service_min) // 60 % 24:02.0f}:{(SHIFT_START_HOUR * 60 + round(arr_min) + stop_service_min) % 60:02.0f}",
+            "distance_from_prev_km": leg_dist, "tanggal_masuk": order_obj["tanggal_masuk"],
+            "nomor_awb": order_obj.get("nomor_awb", ""),
+            "kabupaten_kota": order_obj.get("kabupaten_kota", ""),
+            "jam_masuk": order_obj.get("jam_masuk", ""),
+            "jumlah_bku": order_obj.get("jumlah_bku", order_obj.get("box", 0)),
+            "age": order_obj.get("age", 0),
+        })
+        prev = node
 
-def select_smart_orders(orders, n_vehicles, capacity_box):
-    if not orders or n_vehicles <= 0:
-        return [], list(orders)
+    final_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
+    dist += dist_km[prev][0]
+    actual_return_time_min = time_min[prev][0] if prev != 0 else 0
+    total_time_min = arr_min + final_service_min + actual_return_time_min
 
-    lateral_dists = _calculate_lateral_distances(orders)
+    backlog = [{**zone_orders[idx], "backlog_reason": "Shift time limit exceeded (9 hours)"} for idx in range(len(zone_orders)) if idx not in visited]
     
-    for i, o in enumerate(orders):
-        o['lateral_dist'] = lateral_dists[i]
-        o['dist'] = haversine_km(o['lat'], o['lng'], DEPOT_LAT, DEPOT_LNG)
-        o['critical'] = 1 if o.get('age', 0) >= 3 else 0
-        o['is_lateral_outlier'] = 1 if o['lateral_dist'] > 0.05 else 0
-        
-    orders_sorted_by_priority = sorted(orders, key=lambda x: (
-        -x['critical'], 
-        x['is_lateral_outlier'], 
-        -x['dist']
-    ))
+    summary = [seq, box, round(dist, 2), round(total_time_min), round(100.0 * box / VEHICLE_CAPACITY_BOX, 1), ""]
+    return v_route, backlog, summary
+
+
+def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
+    """
+    Strict Territorial Partitioning:
+    Splits orders into N geographic zones (North to South) and solves each independently.
+    """
+    if not orders:
+        return [], [], []
+
+    # Sort all orders by Latitude (North to South)
+    orders_sorted_lat = sorted(orders, key=lambda x: x['lat'], reverse=True)
     
-    total_allowed_stops = n_vehicles * 32
-    
-    selected_orders = []
-    unassigned = []
-    current_fleet_boxes = 0
-    
-    for o in orders_sorted_by_priority:
-        # EXPLICIT UNCONDITIONAL PRUNING: Drop non-critical lateral outliers immediately
-        if o['is_lateral_outlier'] == 1 and o['critical'] == 0:
-            o['backlog_reason'] = "Lateral Outlier (Geographic Pruning)"
-            unassigned.append(o)
+    # Partition into n equal chunks
+    chunk_size = math.ceil(len(orders_sorted_lat) / n)
+    zones = []
+    for i in range(n):
+        chunk = orders_sorted_lat[i * chunk_size : (i + 1) * chunk_size]
+        if chunk:
+            zones.append(chunk)
+
+    all_routes, all_backlog, all_summary = [], [], []
+
+    for zone_idx, zone_orders in enumerate(zones):
+        if zone_idx >= NUM_VEHICLES:
+            # If scenario uses fewer vehicles than zones, fold remaining into last vehicle
+            zones[-1].extend(zone_orders)
             continue
-            
-        fits_stop_count = len(selected_orders) < total_allowed_stops
-        fits_box_count = (current_fleet_boxes + o.get('box', 0)) <= (n_vehicles * capacity_box)
-        
-        if fits_stop_count and fits_box_count:
-            selected_orders.append(o)
-            current_fleet_boxes += o.get('box', 0)
-        else:
-            o['backlog_reason'] = "Time Budget Cutoff"
-            unassigned.append(o)
-            
-    return selected_orders, unassigned
+
+        vehicle = VEHICLES[zone_idx]
+        if not zone_orders:
+            all_summary.append([vehicle["name"], vehicle["driver"], 0, 0, 0.0, 0, 0, ""])
+            continue
+
+        # Build distance & time matrices for this specific zone only
+        locations = [{"lat": depot_lat, "lng": depot_lng}] + zone_orders
+        dist_km, time_min = build_distance_time_matrices(locations)
+
+        v_route, backlog, summary = solve_zone_routing(zone_orders, route_date, dist_km, time_min)
+
+        for r in v_route:
+            r["vehicle"] = vehicle["name"]
+            r["driver"] = vehicle["driver"]
+            r["nopol"] = vehicle.get("nopol", "")
+
+        all_routes.extend(v_route)
+        all_backlog.extend(backlog)
+        all_summary.append([vehicle["name"], vehicle["driver"]] + summary)
+
+    return all_routes, all_backlog, all_summary
 
 
 def solve_all_scenarios(orders, route_date):
@@ -614,16 +578,9 @@ def solve_all_scenarios(orders, route_date):
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
-            selected_orders, pre_backlog = select_smart_orders(orders, n, VEHICLE_CAPACITY_BOX)
-            
-            locations = [{"lat": DEPOT_LAT, "lng": DEPOT_LNG}] + selected_orders
-            dist_km, time_min = build_distance_time_matrices(locations)
-            
-            routes, solver_backlog, summary = solve_routing(selected_orders, route_date, n, dist_km, time_min)
-            final_backlog = pre_backlog + solver_backlog
-            
-            print(f"  Served {sum(row[2] for row in summary)}/{len(orders)}, backlog {len(final_backlog)}, dist {sum(row[4] for row in summary):.1f}km")
-            scenarios[n] = {"routes": routes, "backlog": final_backlog, "summary": summary}
+            routes, backlog, summary = solve_clustered_scenario(orders, route_date, n, DEPOT_LAT, DEPOT_LNG)
+            print(f"  Served {sum(row[2] for row in summary)}/{len(orders)}, backlog {len(backlog)}, dist {sum(row[4] for row in summary):.1f}km")
+            scenarios[n] = {"routes": routes, "backlog": backlog, "summary": summary}
         except Exception as e:
             print(f"  Failed: {e}")
             scenarios[n] = {"error": str(e)}
