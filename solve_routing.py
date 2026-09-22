@@ -145,6 +145,19 @@ TRAFFIC_TIME_MULTIPLIER = _env_num("TRAFFIC_TIME_MULTIPLIER", 1.5)
 # "count"-> original behavior: split into equal-sized chunks by order count.
 ZONE_BALANCE_MODE = os.environ.get("ZONE_BALANCE_MODE", "box").strip().lower()
 
+# Isolation guard: zoning is latitude-band only, so a couple of stops that
+# are geographically far from the rest of their band (but happen to fall in
+# the same band) get dragged into a truck's route as a costly detour instead
+# of being flagged for a human to decide on. 0 = disabled (legacy behavior).
+MAX_ISOLATION_KM = _env_num("MAX_ISOLATION_KM", 0)
+# A group of stops smaller than this, and smaller than the zone's main
+# cluster, that sits more than MAX_ISOLATION_KM from everything else in the
+# zone is treated as an isolated micro-cluster rather than routed.
+MIN_ISOLATED_CLUSTER_SIZE = int(_env_num("MIN_ISOLATED_CLUSTER_SIZE", 3, cast=int))
+# SLA-aged orders bypass the isolation guard - missing an SLA is usually
+# worse than an inefficient detour, so these are still attempted regardless.
+ISOLATION_PROTECT_AGE_DAYS = int(_env_num("ISOLATION_PROTECT_AGE_DAYS", 3, cast=int))
+
 # Solve each scenario's zones concurrently instead of one after another.
 PARALLEL_ZONE_SOLVE = _env_bool("PARALLEL_ZONE_SOLVE", True)
 
@@ -594,6 +607,71 @@ def _classify_backlog_reason(box_used_before, order_box, capacity):
     return "Shift time limit exceeded (9 hours)"
 
 
+def _find_distance_clusters(zone_orders, dist_km_full, max_isolation_km):
+    """Single-linkage clustering of a zone's orders using the shared full
+    matrix: two orders are in the same cluster if there's a chain of stops
+    between them each no more than max_isolation_km apart. Returns a list of
+    clusters, each a list of indices into zone_orders."""
+    n = len(zone_orders)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        gi = zone_orders[i]["_gidx"] + 1
+        for j in range(i + 1, n):
+            gj = zone_orders[j]["_gidx"] + 1
+            if dist_km_full[gi][gj] <= max_isolation_km:
+                union(i, j)
+
+    clusters = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+    return list(clusters.values())
+
+
+def split_isolated_orders(zone_orders, dist_km_full, max_isolation_km,
+                           min_cluster_size, protect_age_days):
+    """Pulls out small, geographically detached groups of stops within a zone
+    (e.g. 1-2 orders sitting 30+km from the rest of the zone's stops) so the
+    solver doesn't send a truck on a large detour to reach them. Only applies
+    when there's a genuinely larger 'main route' elsewhere in the zone to be
+    isolated from, and never applies to SLA-aged orders."""
+    if max_isolation_km <= 0 or len(zone_orders) < 2:
+        return zone_orders, []
+
+    clusters = _find_distance_clusters(zone_orders, dist_km_full, max_isolation_km)
+    if len(clusters) <= 1:
+        return zone_orders, []
+
+    largest_size = max(len(c) for c in clusters)
+    kept, isolated = [], []
+    for cluster in clusters:
+        is_isolated = len(cluster) < min_cluster_size and len(cluster) < largest_size
+        for idx in cluster:
+            o = zone_orders[idx]
+            if is_isolated and o.get("age", 0) < protect_age_days:
+                isolated.append({
+                    **o,
+                    "backlog_reason": (
+                        f"Isolated stop ({len(cluster)} order(s) in a micro-cluster "
+                        f"more than {max_isolation_km:g}km from the rest of the zone)"
+                    ),
+                })
+            else:
+                kept.append(o)
+    return kept, isolated
+
+
 def _split_unroutable_by_capacity(orders):
     """Orders whose box count alone exceeds a single vehicle's capacity can
     never be routed by any scenario, no matter how zones are balanced. Pulling
@@ -768,14 +846,27 @@ def solve_clustered_scenario(orders, n, dist_km_full, time_min_full):
     def _solve_one(zone_orders, vehicle):
         if not zone_orders:
             return vehicle, [], [], [0, 0, 0.0, 0, 0.0, "Unused"]
-        global_indices = [o["_gidx"] for o in zone_orders]
+
+        routable, isolated_backlog = split_isolated_orders(
+            zone_orders, dist_km_full, MAX_ISOLATION_KM,
+            MIN_ISOLATED_CLUSTER_SIZE, ISOLATION_PROTECT_AGE_DAYS,
+        )
+        if isolated_backlog:
+            logger.info(
+                f"[{vehicle['name']}] held back {len(isolated_backlog)} isolated stop(s) "
+                f"from the route (>{MAX_ISOLATION_KM:g}km from the rest of the zone)."
+            )
+        if not routable:
+            return vehicle, [], isolated_backlog, [0, 0, 0.0, 0, 0.0, "Unused"]
+
+        global_indices = [o["_gidx"] for o in routable]
         zdist, ztime = slice_matrix(dist_km_full, time_min_full, global_indices)
-        v_route, backlog, summary = solve_zone_routing(zone_orders, zdist, ztime)
+        v_route, backlog, summary = solve_zone_routing(routable, zdist, ztime)
         for r in v_route:
             r["vehicle"] = vehicle["name"]
             r["driver"] = vehicle["driver"]
             r["nopol"] = vehicle.get("nopol", "")
-        return vehicle, v_route, backlog, summary
+        return vehicle, v_route, isolated_backlog + backlog, summary
 
     results_by_idx = {}
     if PARALLEL_ZONE_SOLVE and len(tasks) > 1:
