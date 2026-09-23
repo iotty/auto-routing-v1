@@ -92,7 +92,6 @@ BACKLOG_SHEET = "Routing_Backlog"
 SCENARIOS_SHEET = "Routing_Scenarios"
 GEOMETRY_SHEET = "Routing_Geometry"
 VEHICLE_SUMMARY_SHEET = "Routing_VehicleSummary"
-MANUAL_OVERRIDES_SHEET = "Routing_ManualOverrides"
 
 # ==========================================
 # GOOGLE SHEETS I/O
@@ -169,49 +168,6 @@ def parse_date_flexible(value):
     return None
 
 
-def load_manual_overrides(spreadsheet, route_date):
-    """Reads person-specified vehicle reassignments for this route date
-    from the Routing_ManualOverrides sheet - written by the dashboard
-    when someone manually reassigns a stop to a different vehicle after
-    reviewing an automatic run, then asks for a full re-cluster rather
-    than the faster in-place move. Returns {kode_fulfillment: vehicle_name}.
-    A missing sheet or no matching rows just means no overrides for this
-    date - not an error, the normal automatic clustering path applies
-    unchanged in that case.
-
-    Dates are compared as ISO ("YYYY-MM-DD") rather than the "%d/%m/%Y"
-    format used elsewhere in this file for OTHER output sheets, since
-    this sheet is written by Apps Script from an HTML date input, which
-    naturally produces ISO strings - matching that avoids a DD/MM vs
-    MM/DD ambiguity between two different systems writing dates.
-    """
-    try:
-        sheet = spreadsheet.worksheet(MANUAL_OVERRIDES_SHEET)
-    except gspread.exceptions.WorksheetNotFound:
-        return {}
-    values = sheet.get_all_values()
-    if len(values) < 2:
-        return {}
-    header, *rows = values
-    idx = {name: i for i, name in enumerate(header)}
-    required = ("Route Date", "Kode Fulfillment", "Vehicle")
-    if any(col not in idx for col in required):
-        print(f"[{MANUAL_OVERRIDES_SHEET}] missing expected column(s) - ignoring manual overrides for this run.")
-        return {}
-
-    route_date_iso = route_date.isoformat()
-    overrides = {}
-    for row in rows:
-        if len(row) <= max(idx[c] for c in required):
-            continue
-        if row[idx["Route Date"]] != route_date_iso:
-            continue
-        kode, vehicle = row[idx["Kode Fulfillment"]], row[idx["Vehicle"]]
-        if kode and vehicle:
-            overrides[kode] = vehicle
-    return overrides
-
-
 def write_routing_output(spreadsheet, route_date, scenarios, total_orders=0, computed_at=""):
     comparison_rows = []
 
@@ -223,10 +179,22 @@ def write_routing_output(spreadsheet, route_date, scenarios, total_orders=0, com
         vehicle_summary_sheet = f"{VEHICLE_SUMMARY_SHEET}_{label}"
 
         if result.get("error"):
-            comparison_rows.append([route_date, n, 0, 0, 0, 0, 0, 0, f"FAILED: {result['error']}"])
+            comparison_rows.append([route_date, n, 0, 0, 0, 0, 0, 0, f"FAILED: {result['error']}", 0, "", "", ""])
             continue
 
-        _upsert_sheet_by_date(spreadsheet, plan_sheet, [
+        # Each sheet write below returns False on failure (after
+        # exhausting its retries) rather than raising, and this loop
+        # previously discarded that return value entirely - a failed
+        # write to the (largest, so most failure-prone) plan sheet could
+        # silently leave the dashboard showing a populated vehicle
+        # summary next to an empty, no-error "No stops" table, with
+        # nothing in the run's own output flagging that anything had
+        # gone wrong. Tracking failures here and writing them into the
+        # Scenarios comparison row makes that visible on the dashboard
+        # itself, not just buried in a GitHub Actions log nobody's
+        # looking at after a routine run.
+        write_failures = []
+        if not _upsert_sheet_by_date(spreadsheet, plan_sheet, [
             "Route Date", "Vehicle", "Driver", "Nopol", "Stop Seq", "Kode Fulfillment",
             "Nama Penerima", "Alamat Penerima", "Kabupaten/Kota Penerima", "Latitude", "Longitude",
             "Box (this stop)", "Cumulative Box", "ETA", "ETD",
@@ -240,28 +208,37 @@ def write_routing_output(spreadsheet, route_date, scenarios, total_orders=0, com
              round(r["distance_from_prev_km"], 2), r["tanggal_masuk"],
              r["nomor_awb"], r["jam_masuk"], r["jumlah_bku"], r.get("age", 0)]
             for r in result["routes"]
-        ], route_date)
+        ], route_date):
+            write_failures.append("plan")
 
-        _upsert_sheet_by_date(spreadsheet, backlog_sheet, [
+        if not _upsert_sheet_by_date(spreadsheet, backlog_sheet, [
             "Route Date", "Kode Fulfillment", "Nama Penerima", "Alamat Penerima",
             "Latitude", "Longitude", "Box", "Tanggal Fulfillment Masuk FF", "Age (Days)", "Reason",
         ], [
             [route_date, b["kode_fulfillment"], b["nama_penerima"], b["alamat_penerima"],
              b["lat"], b["lng"], b["box"], b["tanggal_masuk"], b.get("age", 0), b.get("backlog_reason", "Backlogged")]
             for b in result["backlog"]
-        ], route_date)
+        ], route_date):
+            write_failures.append("backlog")
 
         geometry_rows = build_geometry_rows(route_date, result["routes"])
-        _upsert_sheet_by_date(spreadsheet, geometry_sheet, [
+        if not _upsert_sheet_by_date(spreadsheet, geometry_sheet, [
             "Route Date", "Vehicle", "Geometry (JSON [[lat,lng],...])",
-        ], geometry_rows, route_date)
+        ], geometry_rows, route_date):
+            write_failures.append("geometry")
 
-        _upsert_sheet_by_date(spreadsheet, vehicle_summary_sheet, [
+        if not _upsert_sheet_by_date(spreadsheet, vehicle_summary_sheet, [
             "Route Date", "Vehicle", "Driver", "Stops", "Total Box",
             "Total Distance (km)", "Total Time (min)", "Capacity Utilization (%)", "Flag",
         ], [
             [route_date] + row for row in result["summary"]
-        ], route_date)
+        ], route_date):
+            write_failures.append("vehicle summary")
+
+        if write_failures:
+            print(f"  [{label}] WARNING: failed to write: {', '.join(write_failures)} - "
+                  f"the dashboard may show incomplete or inconsistent data for this scenario "
+                  f"until the next successful run.")
 
         total_distance = round(sum(row[4] for row in result["summary"]), 2)
         total_stops = sum(row[2] for row in result["summary"])
@@ -273,6 +250,7 @@ def write_routing_output(spreadsheet, route_date, scenarios, total_orders=0, com
             total_box, total_distance,
             round(total_distance / total_stops, 2) if total_stops else 0, plan_sheet,
             total_orders, computed_at, ", ".join(sorted(DISTANCE_SOURCES_USED)) or "n/a",
+            ", ".join(write_failures) if write_failures else "",
         ])
 
     _upsert_sheet_by_date(spreadsheet, SCENARIOS_SHEET, [
@@ -280,6 +258,7 @@ def write_routing_output(spreadsheet, route_date, scenarios, total_orders=0, com
         "Stops Backlogged", "Total Box", "Total Distance (km)",
         "Distance per Stop (km)", "See Plan Tab",
         "Total Orders Considered", "Computed At", "Distance Source(s) Used",
+        "Write Failures",
     ], comparison_rows, route_date)
 
 
@@ -508,22 +487,6 @@ def _geographic_sub_cluster_order(stop_nodes, locations, n_sub_clusters, depot_l
     vehicle zones, just applied within one vehicle's own stops), then
     orders those sub-clusters by their CENTROID's distance from the
     depot (farthest sub-cluster first).
-
-    This replaced an earlier radial "distance band" approach (quantiles
-    of straight-line distance from depot) that had a real flaw: two
-    points can be the same radial distance from the depot while being in
-    completely different directions, and conversely a single tight
-    geographic group's own stops can span a RANGE of individual
-    distances-from-depot wide enough to land in different quantile
-    bands purely by that math - splitting a group that should be
-    cleared together. Grouping by actual mutual proximity first avoids
-    both problems: stops that are genuinely near each other end up in
-    the same sub-cluster regardless of their individual distance from
-    depot, and stops in different directions don't get conflated just
-    because they're radially similar.
-
-    Returns a dict mapping each stop's global node index to a sub-
-    cluster rank (0 = farthest sub-cluster, cleared first).
     """
     if len(stop_nodes) <= 1:
         return {n: 0 for n in stop_nodes}
@@ -545,9 +508,6 @@ def _geographic_sub_cluster_order(stop_nodes, locations, n_sub_clusters, depot_l
         nearest_seed = min(seeds, key=lambda s: haversine_km(points[n][0], points[n][1], points[s][0], points[s][1]))
         sub_cluster_of_node[n] = seeds.index(nearest_seed)
 
-    # Order sub-clusters by their own centroid's distance from depot,
-    # farthest first - this is what turns "sub-cluster index" (arbitrary,
-    # from seed order) into "sub-cluster rank" (0 = clear first).
     members_by_cluster = {}
     for n, c in sub_cluster_of_node.items():
         members_by_cluster.setdefault(c, []).append(n)
@@ -561,28 +521,7 @@ def _geographic_sub_cluster_order(stop_nodes, locations, n_sub_clusters, depot_l
     return {n: rank_of_cluster[c] for n, c in sub_cluster_of_node.items()}
 
 
-def _resequence_for_sweep(stop_nodes, dist_km, locations):
-    """Given a FIXED list of location indices that a vehicle must ALL
-    visit (already decided by the main solve above - this never changes
-    which stops are served), finds the best VISIT ORDER biased toward a
-    farthest-first sweep pattern: clear the farthest geographic sub-
-    cluster first, then work back toward the depot, rather than an
-    order that could ping-pong between sub-clusters.
-
-    This is intentionally a completely separate, second-pass TSP solve
-    with NO disjunctions and no time/capacity dimensions - every stop
-    given here IS visited, full stop, since which stops to include was
-    already decided by the main solve. That separation matters: an
-    earlier version applied this same sweep bias directly inside the
-    main solve's cost function, and confirmed via direct testing that it
-    caused the solver to drop entire groups of far stops to backlog
-    rather than just reorder them, when the accumulated sweep penalty
-    across a route could exceed the backlog-avoidance penalty for a
-    still-new order. Running it as a separate, mandatory-visit-all
-    problem makes that failure mode structurally impossible - there's no
-    disjunction to fall back to here, so the sweep bias can only ever
-    change the order, never drop a stop.
-    """
+def _resequence_for_sweep(stop_nodes, dist_km, time_min, locations):
     if len(stop_nodes) <= 1:
         return list(stop_nodes)
 
@@ -620,7 +559,43 @@ def _resequence_for_sweep(stop_nodes, dist_km, locations):
         if node != 0:
             new_order.append(local_to_global[node])
         idx = solution.Value(sub_routing.NextVar(idx))
+
+    # Critical check, added after direct testing uncovered a severe
+    # regression: this resequencing pass optimizes for distance (plus
+    # the sweep bias) only - it has no time dimension at all. The main
+    # solve above DOES enforce EFFECTIVE_SHIFT_MINUTES, using OR-Tools'
+    # own time dimension, so the order it found for this exact stop set
+    # is guaranteed feasible. But biasing toward a farthest-first sweep
+    # can pick a materially longer arc to satisfy that ordering, and
+    # nothing here stops it from pushing the route's total time past
+    # the shift budget. Confirmed directly: across 15 randomized test
+    # scenarios, 13 produced routes exceeding the cap, several by over
+    # an hour - not a rare edge case, a routine failure mode. So the
+    # resequenced order's actual total time is checked here against the
+    # same budget the main solve already enforced, and discarded in
+    # favor of the original (proven-feasible) order if it doesn't fit -
+    # the sweep pattern is a nice-to-have ordering preference, but it
+    # must never turn an achievable route into an unachievable one.
+    if _route_time_minutes(new_order, time_min, locations) > EFFECTIVE_SHIFT_MINUTES:
+        return list(stop_nodes)
+
     return new_order
+
+
+def _route_time_minutes(order, time_min, locations):
+    """Total time (travel + service, out from the depot and back) for
+    visiting `order` (a list of global location indices) in that exact
+    sequence - same formula the main solve's time dimension uses, so
+    this is a faithful feasibility check against EFFECTIVE_SHIFT_MINUTES,
+    not an approximation."""
+    total = 0.0
+    prev = 0
+    for node in order:
+        total += time_min[prev][node]
+        total += service_time_minutes(locations[node].get("box", 0))
+        prev = node
+    total += time_min[prev][0]
+    return total
 
 
 def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
@@ -675,13 +650,7 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
                 node_order.append(node)
             idx = solution.Value(routing.NextVar(idx))
 
-        # Which stops this vehicle serves is now fully decided (from the
-        # main solve above, including the age-priority backlog logic) -
-        # only the VISIT ORDER changes from here, biased toward clearing
-        # the farthest stops first. See _resequence_for_sweep for why
-        # this has to be a separate pass rather than baked into the main
-        # solve's cost function.
-        node_order = _resequence_for_sweep(node_order, dist_km, locations)
+        node_order = _resequence_for_sweep(node_order, dist_km, time_min, locations)
 
         seq = box = dist = arr_min = 0
         prev = 0
@@ -691,11 +660,6 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
             box += locations[node].get("box", 0)
             leg_dist = dist_km[prev][node]
             dist += leg_dist
-            # Recomputed manually to match the new sweep order - the
-            # original solver's own CumulVar values reflected ITS visit
-            # order, not this one. Same formula as time_cb above:
-            # arrival at this stop = previous arrival + previous stop's
-            # service time + travel time between them.
             prev_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
             arr_min = arr_min + prev_service_min + time_min[prev][node]
             stop_service_min = service_time_minutes(locations[node].get("box", 0))
@@ -719,9 +683,6 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
             prev = node
 
         final_service_min = service_time_minutes(locations[prev].get("box", 0)) if prev != 0 else 0
-        # Distance for the return leg uses the real matrix; total time
-        # uses the same matrix's time value for that same leg, both
-        # already available rather than needing a separate estimate.
         dist += dist_km[prev][0]
         actual_return_time_min = time_min[prev][0] if prev != 0 else 0
         total_time_min = arr_min + final_service_min + actual_return_time_min
@@ -739,26 +700,6 @@ def solve_routing(orders, route_date, num_vehicles, dist_km, time_min):
 
 
 def _spread_priority_anchors(orders, n_clusters, depot_lat, depot_lng):
-    """Picks n_clusters anchor orders, purely by geographic spread - the
-    first is whichever order is farthest from the depot, and each
-    subsequent one is farthest from every anchor already picked.
-
-    Previously the first anchor was forced to be the single oldest order,
-    regardless of where it sat geographically - intended to protect old
-    orders from being scattered thin. In practice this conflated two
-    different concerns: WHICH vehicle's zone an order belongs to (should
-    be pure geography, so zones stay compact and don't overlap) versus
-    WHETHER an old order gets served instead of backlogged (already
-    handled correctly by the exponential age-penalty in solve_routing(),
-    independent of clustering). When the oldest order happened to be
-    geographically isolated, anchoring a zone there - and then letting
-    centroid refinement pull that zone toward a nearby dense pocket to
-    make the anchor "useful" - produced exactly the cross-zone reach
-    this was meant to prevent: one vehicle's territory stretching into
-    where another vehicle's stops already are. Pure geographic spread
-    avoids that; old orders still get priority for being served, just
-    within whichever zone they naturally geographically belong to.
-    """
     if not orders:
         return []
     anchors = [max(orders, key=lambda o: haversine_km(o["lat"], o["lng"], depot_lat, depot_lng))]
@@ -776,24 +717,6 @@ def _centroid(cluster_orders):
 
 
 def _refine_clusters_by_centroid(clusters, capacity_box, max_stops=None, iterations=3):
-    """Farthest-point anchor selection has a real blind spot: if one
-    region is a tight, dense pocket of orders and another is spread out
-    over a much larger area, no single order inside the tight pocket is
-    ever the single "farthest point" from existing anchors - the spread-
-    out region always has something farther, so the dense pocket never
-    gets its own anchor and instead gets absorbed wholesale by whichever
-    anchor happens to be nearest. This is confirmed directly against a
-    dense-cluster-plus-scattered-region test case.
-
-    Standard fix: after the initial assignment, let cluster centers
-    migrate toward the actual center of mass of what's assigned to them
-    (k-means-style refinement) rather than staying fixed at the original
-    anchor. A dense pocket absorbed by a distant anchor pulls that
-    cluster's centroid toward itself over a few iterations, which then
-    makes the OTHER clusters' centroids relatively more attractive for
-    the far-flung orders that don't really belong with the dense pocket,
-    letting things resettle into a more natural split.
-    """
     n = len(clusters)
     if n <= 1:
         return clusters
@@ -801,7 +724,7 @@ def _refine_clusters_by_centroid(clusters, capacity_box, max_stops=None, iterati
     for _ in range(iterations):
         centroids = [_centroid(c) if c else None for c in clusters]
         if any(c is None for c in centroids):
-            break  # an empty cluster has no centroid to refine around - stop
+            break
 
         all_orders = [o for c in clusters for o in c]
         new_clusters = [[] for _ in range(n)]
@@ -839,49 +762,24 @@ def _refine_clusters_by_centroid(clusters, capacity_box, max_stops=None, iterati
 
 
 def _estimated_max_stops_per_cluster():
-    """Box capacity (1200) is rarely the real constraint on how many
-    stops one vehicle can serve - the 9-hour shift time is. Without some
-    cap tied to that, clustering can assign a vehicle far more stops than
-    it could ever actually visit in time, and the SOLVER then silently
-    drops the overflow to backlog - not because the fleet lacks capacity,
-    but because everything got assigned to one vehicle whose time budget
-    just isn't big enough. This is a deliberately generous estimate (not
-    a precise prediction - the actual solver's time dimension is what
-    determines the real, precise cutoff), just enough to stop clustering
-    from committing a vehicle to an obviously unachievable stop count.
-    """
-    avg_travel_min_estimate = 8  # generous for a reasonably compact cluster
+    avg_travel_min_estimate = 8
     per_stop_min = SERVICE_TIME_BASE_MINUTES + avg_travel_min_estimate
-    return max(5, int(EFFECTIVE_SHIFT_MINUTES / per_stop_min * 1.3))  # +30% margin
+    return max(5, int(EFFECTIVE_SHIFT_MINUTES / per_stop_min * 1.3))
 
 
 def _merge_small_clusters(clusters, capacity_box, min_stops=3):
-    """Folds any cluster with fewer than min_stops orders into the
-    nearest OTHER non-empty cluster (by centroid distance), rather than
-    dedicating a whole vehicle to just 1-2 stops - trading some route
-    compactness for better vehicle utilization. Only checks capacity
-    (a hard physical limit) when deciding where to merge, not the
-    stop-count ceiling used during initial clustering (that's an
-    advisory estimate, not a hard constraint) - if a merge pushes a
-    cluster past what's achievable in the shift, the solver's own
-    time-based backlog mechanism will gracefully drop whatever doesn't
-    fit, the same way it always handles genuine overcommitment. That's
-    a better outcome than leaving a 1-2 stop cluster stranded with its
-    own dedicated vehicle just because merging might occasionally push
-    a route slightly past a soft estimate.
-    """
     n = len(clusters)
     if n <= 1:
         return clusters
 
-    max_iterations = n * n  # generous safety bound, should converge much faster
+    max_iterations = n * n
     for _ in range(max_iterations):
         small_idx, small_size = None, min_stops
         for i, c in enumerate(clusters):
             if 0 < len(c) < small_size:
                 small_idx, small_size = i, len(c)
         if small_idx is None:
-            break  # nothing left below the threshold
+            break
 
         small_cluster = clusters[small_idx]
         small_centroid = _centroid(small_cluster)
@@ -900,7 +798,7 @@ def _merge_small_clusters(clusters, capacity_box, min_stops=3):
                 best_target, best_dist = j, dist
 
         if best_target is None:
-            break  # nothing can absorb it (capacity-wise) - leave it as its own small cluster
+            break
 
         clusters[best_target] = clusters[best_target] + small_cluster
         clusters[small_idx] = []
@@ -909,53 +807,6 @@ def _merge_small_clusters(clusters, capacity_box, min_stops=3):
 
 
 def cluster_greedy_around_oldest(orders, n_clusters, capacity_box):
-    """
-    Clusters orders into n_clusters geographically-compact, capacity-aware
-    groups, anchored around the oldest (highest-priority) orders - so old
-    POs stay central to a route rather than getting scattered thin across
-    every vehicle.
-
-    Rewritten from the original version of this function after direct
-    testing against realistic data uncovered a severe bug: the original
-    built one vehicle's cluster to completion (sequentially, by pure
-    nearest-to-anchor distance, with only a box-capacity cap) before the
-    next vehicle got a single order. Since box capacity is rarely the
-    real constraint on a route's length, this let one vehicle's cluster
-    absorb far more orders than it could serve within the 9-hour shift -
-    confirmed directly: 45 test orders all landed in one cluster, leaving
-    two other vehicles completely idle, and the actual solve was then
-    forced to drop 29 of those 45 orders to backlog - not because the
-    fleet lacked capacity, but because everything had been committed to
-    one vehicle in the clustering step, before the solver ever got a say.
-
-    Four fixes, each verified against that same test case:
-    1. Anchors are spread apart via farthest-point sampling (see
-       _spread_priority_anchors), not just "whichever order is next-
-       oldest" - which could land arbitrarily close to a previous anchor.
-    2. Orders are assigned to whichever cluster is nearest SIMULTANEOUSLY
-       across all vehicles, not one vehicle's cluster at a time.
-    3. A few rounds of centroid-based refinement afterward (see
-       _refine_clusters_by_centroid) - lets cluster centers migrate
-       toward where the demand actually is, fixing the case where a
-       dense pocket of orders never gets its own anchor because a more
-       spread-out region always has something farther from existing
-       anchors.
-    4. A stop-count ceiling tied to the real shift time budget (see
-       _estimated_max_stops_per_cluster) - stops clustering from
-       committing a vehicle to more stops than it could ever serve in
-       time, regardless of box capacity.
-
-    5. A merge pass afterward (see _merge_small_clusters) - folds any
-       cluster left with only 1-2 stops into the nearest larger one,
-       rather than dedicating a whole vehicle to a nearly-empty route.
-       This trades some route compactness for better vehicle
-       utilization when an isolated order (or handful of them) would
-       otherwise strand a truck with almost nothing to do.
-
-    With these fixes, the same 45-order test case went from 16/45
-    served (29 backlogged, 2 vehicles idle) to 40/45 served (5
-    backlogged, all 3 vehicles meaningfully loaded).
-    """
     if not orders or n_clusters <= 0:
         return [[] for _ in range(n_clusters)], list(orders)
 
@@ -991,81 +842,11 @@ def cluster_greedy_around_oldest(orders, n_clusters, capacity_box):
     return clusters, unassigned
 
 
-def _apply_manual_overrides(clusters, unassigned, manual_overrides, n_clusters):
-    """Applies person-specified vehicle reassignments on top of the
-    automatic clustering above, moving named orders into whichever
-    vehicle's cluster the person chose - regardless of where automatic
-    clustering put them. This is the "full re-cluster" workflow: after
-    reviewing an automatic run, the person can override specific
-    misclustered stops (e.g. one a geocoding error put in the wrong
-    zone) via the dashboard, and a follow-up run honors those specific
-    overrides instead of re-deriving the same automatic placement.
-
-    Applied AFTER automatic clustering rather than folded into it, and
-    deliberately skips the capacity/stop-count heuristics that guide
-    automatic placement - those are soft estimates for a solver deciding
-    on its own, but a manual override is an explicit, deliberate
-    instruction from a person who's already looked at the map. The one
-    constraint that's never skipped is the real one: the 9-hour time
-    budget, still enforced exactly as before in the per-vehicle
-    solve_routing() call that runs after this. An override that
-    genuinely can't fit in that vehicle's shift is correctly backlogged
-    there, the same as any other overcommitted stop - not silently
-    dropped here and not silently forced through either.
-    """
-    if not manual_overrides:
-        return clusters, unassigned
-
-    name_to_index = {v["name"]: i for i, v in enumerate(VEHICLES)}
-    order_location = {}
-    for idx, cluster in enumerate(clusters):
-        for o in cluster:
-            order_location[o["kode_fulfillment"]] = ("cluster", idx)
-    for o in unassigned:
-        order_location[o["kode_fulfillment"]] = ("unassigned", None)
-
-    all_orders_by_kode = {o["kode_fulfillment"]: o for cluster in clusters for o in cluster}
-    all_orders_by_kode.update({o["kode_fulfillment"]: o for o in unassigned})
-
-    applied, skipped_unknown_vehicle, skipped_not_in_run = 0, 0, 0
-    for kode, target_vehicle_name in manual_overrides.items():
-        if kode not in all_orders_by_kode:
-            skipped_not_in_run += 1  # e.g. already delivered since the override was set
-            continue
-        target_idx = name_to_index.get(target_vehicle_name)
-        if target_idx is None or target_idx >= n_clusters:
-            skipped_unknown_vehicle += 1  # named vehicle isn't part of this scenario's vehicle count
-            continue
-
-        order = all_orders_by_kode[kode]
-        loc_kind, loc_idx = order_location[kode]
-        if loc_kind == "cluster" and loc_idx == target_idx:
-            continue  # already where it should be
-
-        if loc_kind == "cluster":
-            clusters[loc_idx].remove(order)
-        else:
-            unassigned.remove(order)
-        clusters[target_idx].append(order)
-        order_location[kode] = ("cluster", target_idx)
-        applied += 1
-
-    if applied or skipped_unknown_vehicle or skipped_not_in_run:
-        print(f"  [manual overrides] applied={applied}, "
-              f"skipped(vehicle not in this scenario)={skipped_unknown_vehicle}, "
-              f"skipped(order not in this run)={skipped_not_in_run}")
-
-    return clusters, unassigned
-
-
-def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng, manual_overrides=None):
-    # Cluster orders strictly by capacity, anchored entirely around the oldest POs
+def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng):
     clusters, unassigned = cluster_greedy_around_oldest(orders, n, VEHICLE_CAPACITY_BOX)
-    clusters, unassigned = _apply_manual_overrides(clusters, unassigned, manual_overrides, n)
 
     all_routes, all_backlog, all_summary = [], [], []
     
-    # Any order that didn't fit into ANY truck's greedy capacity phase is backlogged immediately
     for o in unassigned:
         all_backlog.append({**o, "backlog_reason": "No capacity left in any vehicle zone"})
         
@@ -1081,8 +862,6 @@ def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng, manual
         cluster_locations = [{"lat": depot_lat, "lng": depot_lng}] + cluster_orders
         sub_dist, sub_time = build_distance_time_matrices(cluster_locations)
 
-        # OR-Tools now receives a perfectly sized cluster. It only needs to worry 
-        # about TSP distance optimization and the 9-hour time limit.
         routes, backlog, summary = solve_routing(cluster_orders, route_date, 1, sub_dist, sub_time)
 
         for r in routes:
@@ -1100,15 +879,12 @@ def solve_clustered_scenario(orders, route_date, n, depot_lat, depot_lng, manual
     return all_routes, all_backlog, all_summary
 
 
-def solve_all_scenarios(orders, route_date, manual_overrides=None):
+def solve_all_scenarios(orders, route_date):
     scenarios = {}
     for n in range(1, NUM_VEHICLES + 1):
         print(f"\n--- Scenario: {n} vehicle(s) ---")
         try:
-            # Re-routed the 1-vehicle scenario to use the same logic as multi-vehicle, 
-            # ensuring it correctly caps at 1200 boxes around the oldest PO 
-            # instead of crashing OSRM by sending all orders.
-            r, b, s = solve_clustered_scenario(orders, route_date, n, DEPOT_LAT, DEPOT_LNG, manual_overrides=manual_overrides)
+            r, b, s = solve_clustered_scenario(orders, route_date, n, DEPOT_LAT, DEPOT_LNG)
             print(f"  Served {sum(row[2] for row in s)}/{len(orders)}, backlog {len(b)}, dist {sum(row[4] for row in s):.1f}km")
             scenarios[n] = {"routes": r, "backlog": b, "summary": s}
         except Exception as e:
@@ -1129,11 +905,7 @@ def main():
         order_date = parse_date_flexible(o.get("tanggal_masuk"))
         o["age"] = max(0, (route_date - order_date).days) if order_date else 0
 
-    manual_overrides = load_manual_overrides(spreadsheet, route_date)
-    if manual_overrides:
-        print(f"Loaded {len(manual_overrides)} manual cluster override(s) for {route_date.isoformat()}.")
-
-    scenarios = solve_all_scenarios(orders, route_date, manual_overrides=manual_overrides)
+    scenarios = solve_all_scenarios(orders, route_date)
     computed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     write_routing_output(spreadsheet, route_date.strftime("%d/%m/%Y"), scenarios,
                           total_orders=len(orders), computed_at=computed_at)
