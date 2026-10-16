@@ -1,11 +1,11 @@
-name: Sync Fulfillment & Frex Data
+name: Sync Logistics Data
 
 on:
   workflow_dispatch: {}   # manual trigger from the Actions tab, or via the dashboard's Fetch data button
   schedule:
-    - cron: '0 10 * * *'    # 17:00 WIB (UTC+7) - runs in UTC, see note below
-    - cron: '0 11 * * *'    # 18:00 WIB (UTC+7)
-    - cron: '0 13 * * *'    # 20:00 WIB (UTC+7)
+    - cron: '0 10 * * *'    # 17:00 (UTC+7) - runs in UTC
+    - cron: '0 11 * * *'    # 18:00 (UTC+7)
+    - cron: '0 13 * * *'    # 20:00 (UTC+7)
 
 jobs:
   sync:
@@ -25,19 +25,30 @@ jobs:
 
       - name: Run pipeline
         env:
+          # Existing secrets (BEARER_TOKEN is supported as a fallback in the script)
           BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
+          WMS_BEARER_TOKEN: ${{ secrets.WMS_BEARER_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           TMS_EMAIL: ${{ secrets.TMS_EMAIL }}
           TMS_PASSWORD: ${{ secrets.TMS_PASSWORD }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+
+          # New privacy-first secrets required by the refactored pipeline.py
+          WMS_EXPORT_URL: ${{ secrets.WMS_EXPORT_URL }}
+          WMS_WAREHOUSE_ID: ${{ secrets.WMS_WAREHOUSE_ID }}
+          WMS_TENANT_ID: ${{ secrets.WMS_TENANT_ID }}
+          WMS_REQUEST_ID: ${{ secrets.WMS_REQUEST_ID }}
+          TMS_BASE_HOST: ${{ secrets.TMS_BASE_HOST }}
+          WMS_SHEET_NAME: ${{ secrets.WMS_SHEET_NAME }}
+          TMS_SHEET_NAME: ${{ secrets.TMS_SHEET_NAME }}
         run: python pipeline.py
 
   keepalive:
     # Scheduled workflows get auto-disabled by GitHub after 60 days with no
     # commit to the repo (this pipeline only writes to Google Sheets, never
     # to git, so that clock would otherwise just keep ticking silently).
-    # Re-enabling via the API on every scheduled run - twice a day - resets
-    # that clock without needing a dummy commit or a third-party action.
+    # Re-enabling via the API on every scheduled run resets that clock
+    # without needing a dummy commit or a third-party action.
     # Runs even if the sync job above fails, so a broken pipeline doesn't
     # also cost you the schedule itself.
     needs: sync
