@@ -6,8 +6,8 @@ Google Sheets tab.
   2. SOURCE B (TMS) - from the Transport Management shipments DataTables endpoint
 
 Sheet tabs written (configurable via env vars):
-  - Default: "Orders_Export" (or set via WMS_SHEET_NAME)
-  - Default: "Shipments_Export" (or set via TMS_SHEET_NAME)
+  - Default: "Fulfillment" (or set via WMS_SHEET_NAME)
+  - Default: "Frex" (or set via TMS_SHEET_NAME)
 
 Header behaviour (applies to BOTH tabs, no hardcoded column list):
   - If the tab is missing or its header row is empty, it's created and the
@@ -34,9 +34,9 @@ Required secrets / env vars:
 
 Optional env vars:
   WMS_SHEET_NAME         - Custom tab name for WMS data (default: "Fulfillment")
-  TMS_SHEET_NAME         - Custom tab name for TMS data (default: "Shipments")
+  TMS_SHEET_NAME         - Custom tab name for TMS data (default: "Frex")
   CACHE_SHEET_NAME       - Custom tab name for logs (default: "Cache_Data")
-  LOCAL_TIMEZONE         - Timezone for logs (default: "UTC")
+  LOCAL_TIMEZONE         - Timezone for logs (default: "Asia/Jakarta")
 """
 
 import io
@@ -74,11 +74,11 @@ EXPORT_TIMEOUT = 600          # Export generation can be slow
 EXPORT_MAX_RETRIES = 3
 ROLLING_WINDOW_DAYS = int(os.environ.get("ROLLING_WINDOW_DAYS", 5))
 
-# Configurable Sheet Tabs & Timezone (avoids leaking internal naming in code)
-WMS_SHEET_NAME = os.environ.get("WMS_SHEET_NAME", "Fulfillment")
-TMS_SHEET_NAME = os.environ.get("TMS_SHEET_NAME", "Shipments")
-CACHE_SHEET_NAME = os.environ.get("CACHE_SHEET_NAME", "Cache_Data")
-LOCAL_TIMEZONE = os.environ.get("LOCAL_TIMEZONE", "Asia/Jakarta")
+# Configurable Sheet Tabs & Timezone (cleaned of accidental quotes/whitespace)
+WMS_SHEET_NAME = os.environ.get("WMS_SHEET_NAME", "").strip().strip('"').strip("'") or "Fulfillment"
+TMS_SHEET_NAME = os.environ.get("TMS_SHEET_NAME", "").strip().strip('"').strip("'") or "Frex"
+CACHE_SHEET_NAME = os.environ.get("CACHE_SHEET_NAME", "").strip().strip('"').strip("'") or "Cache_Data"
+LOCAL_TIMEZONE = os.environ.get("LOCAL_TIMEZONE", "").strip().strip('"').strip("'") or "Asia/Jakarta"
 
 TMS_COOKIE_JAR_FILE = Path(__file__).parent / "session_cookies.pkl"
 TMS_LOGIN_EMAIL_FIELD = "email"
@@ -86,36 +86,56 @@ TMS_LOGIN_PASSWORD_FIELD = "password"
 TMS_LOGIN_TOKEN_FIELD = "_token"
 
 
+def clean_env(val: str) -> str:
+    """Strips accidental whitespace, quotes, and 'KEY=' prefixes from env vars."""
+    if not val:
+        return ""
+    val = val.strip().strip('"').strip("'").strip()
+    if "=" in val and not val.startswith(("http://", "https://", "{")):
+        val = val.split("=", 1)[1].strip().strip('"').strip("'")
+    return val
+
+
 def get_required_env(var_name: str) -> str:
-    val = os.environ.get(var_name)
+    val = clean_env(os.environ.get(var_name, ""))
     if not val:
         print(f"FATAL: Required environment variable '{var_name}' is missing or empty.")
         sys.exit(1)
     return val
 
 
+def sanitize_url(var_name: str) -> str:
+    """Ensures a URL env var is clean and starts with https:// or http://."""
+    url = get_required_env(var_name).rstrip("/")
+    if "http://" in url or "https://" in url:
+        idx = url.find("https://") if "https://" in url else url.find("http://")
+        url = url[idx:]
+    else:
+        url = f"https://{url.lstrip('/')}"
+    return url
+
+
 def load_config():
     """Validate env vars and set up API/Sheets clients. Exits with a clear
     message if anything required is missing or invalid."""
-    # Support both new generic name and legacy name for smooth transition
-    wms_token = os.environ.get("WMS_BEARER_TOKEN") or os.environ.get("BEARER_TOKEN")
+    wms_token = clean_env(os.environ.get("WMS_BEARER_TOKEN") or os.environ.get("BEARER_TOKEN") or "")
     if not wms_token:
         print("FATAL: env var 'WMS_BEARER_TOKEN' is missing/empty.")
         sys.exit(1)
 
     wms_cfg = {
         "token": wms_token,
-        "export_url": get_required_env("WMS_EXPORT_URL").rstrip("/"),
+        "export_url": sanitize_url("WMS_EXPORT_URL"),
         "warehouse_id": get_required_env("WMS_WAREHOUSE_ID"),
         "tenant_id": get_required_env("WMS_TENANT_ID"),
         "request_id": get_required_env("WMS_REQUEST_ID"),
     }
 
-    tms_base = get_required_env("TMS_BASE_HOST").rstrip("/")
+    tms_base = sanitize_url("TMS_BASE_HOST")
     tms_cfg = {
         "base_host": tms_base,
-        "login_url": os.environ.get("TMS_LOGIN_URL", f"{tms_base}/en/admin/login"),
-        "shipments_url": os.environ.get("TMS_SHIPMENTS_URL", f"{tms_base}/en/admin/shipments/shipments"),
+        "login_url": clean_env(os.environ.get("TMS_LOGIN_URL", "")) or f"{tms_base}/en/admin/login",
+        "shipments_url": clean_env(os.environ.get("TMS_SHIPMENTS_URL", "")) or f"{tms_base}/en/admin/shipments/shipments",
         "email": get_required_env("TMS_EMAIL"),
         "password": get_required_env("TMS_PASSWORD"),
     }
@@ -395,7 +415,6 @@ def tms_login():
     resp = TMS_SESSION.post(login_url, data=payload, headers=login_headers, timeout=30)
     resp.raise_for_status()
 
-    # Generic check: if we are still on the login URL after POSTing, authentication failed
     if resp.url.rstrip("/") == login_url.rstrip("/"):
         raise RuntimeError(
             "Login did not appear to succeed (still on login page). Check "
@@ -631,7 +650,10 @@ def update_cache_log(category_name, status_message):
             cell = None
 
         if cell is not None:
-            cache_sheet.update(f"B{cell.row}:C{cell.row}", [[current_time_str, status_message]])
+            cache_sheet.update(
+                range_name=f"B{cell.row}:C{cell.row}",
+                values=[[current_time_str, status_message]],
+            )
         else:
             cache_sheet.append_row([category_name, current_time_str, status_message])
     except Exception:
