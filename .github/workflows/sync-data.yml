@@ -25,15 +25,14 @@ jobs:
 
       - name: Run pipeline
         env:
-          # Existing secrets (BEARER_TOKEN is supported as a fallback in the script)
+          # Existing Secrets (No changes needed in GitHub Secrets)
           BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
-          WMS_BEARER_TOKEN: ${{ secrets.WMS_BEARER_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           TMS_EMAIL: ${{ secrets.TMS_EMAIL }}
           TMS_PASSWORD: ${{ secrets.TMS_PASSWORD }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
 
-          # New privacy-first secrets required by the refactored pipeline.py
+          # New Secrets to add to GitHub Secrets
           WMS_EXPORT_URL: ${{ secrets.WMS_EXPORT_URL }}
           WMS_WAREHOUSE_ID: ${{ secrets.WMS_WAREHOUSE_ID }}
           WMS_TENANT_ID: ${{ secrets.WMS_TENANT_ID }}
