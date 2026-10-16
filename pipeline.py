@@ -2,12 +2,12 @@
 Merged data pipeline: pulls two data sources and writes each into its own
 Google Sheets tab.
 
-  1. FULFILLMENT  - from the Fresh Factory `exports` API (fulfillment_detail)
-  2. FREX         - from the Frex TMS shipments DataTables endpoint
+  1. SOURCE A (WMS) - from the Warehouse Management export API
+  2. SOURCE B (TMS) - from the Transport Management shipments DataTables endpoint
 
-Sheet tabs written:
-  - "Fulfillment"
-  - "Frex"
+Sheet tabs written (configurable via env vars):
+  - Default: "Orders_Export" (or set via WMS_SHEET_NAME)
+  - Default: "Shipments_Export" (or set via TMS_SHEET_NAME)
 
 Header behaviour (applies to BOTH tabs, no hardcoded column list):
   - If the tab is missing or its header row is empty, it's created and the
@@ -19,17 +19,27 @@ Header behaviour (applies to BOTH tabs, no hardcoded column list):
     ignored and unmatched header columns are left blank. This keeps the
     sheet's column layout stable even if the source adds/reorders columns.
 
-Run target: GitHub Actions (see .github/workflows/sync-data.yml).
+Run target: CI/CD Runner (e.g., GitHub Actions).
 Required secrets / env vars:
-  BEARER_TOKEN          - Fresh Factory export API bearer token
-  GOOGLE_SERVICE_ACCOUNT- JSON string of a Google service-account key,
-                          shared with edit access on the target spreadsheet
-  TMS_EMAIL             - Frex TMS login email
-  TMS_PASSWORD          - Frex TMS login password
-  SPREADSHEET_ID        - the target spreadsheet's ID (from its URL, the
-                          part between /d/ and /edit)
+  WMS_BEARER_TOKEN       - WMS export API bearer token
+  WMS_EXPORT_URL         - Full base URL for the WMS export endpoint
+  WMS_WAREHOUSE_ID       - Target warehouse UUID
+  WMS_TENANT_ID          - Target tenant UUID
+  WMS_REQUEST_ID         - Request identifier UUID
+  TMS_BASE_HOST          - Base URL for the TMS portal (e.g., https://tms.example.com)
+  TMS_EMAIL              - TMS login email
+  TMS_PASSWORD           - TMS login password
+  GOOGLE_SERVICE_ACCOUNT - JSON string of a Google service-account key
+  SPREADSHEET_ID         - Target Google Spreadsheet ID
+
+Optional env vars:
+  WMS_SHEET_NAME         - Custom tab name for WMS data (default: "Fulfillment")
+  TMS_SHEET_NAME         - Custom tab name for TMS data (default: "Shipments")
+  CACHE_SHEET_NAME       - Custom tab name for logs (default: "Cache_Data")
+  LOCAL_TIMEZONE         - Timezone for logs (default: "UTC")
 """
 
+import io
 import os
 import re
 import sys
@@ -60,49 +70,57 @@ except ImportError:
 # 1. CONFIG / CREDENTIALS
 # ==========================================
 REQUEST_TIMEOUT = 30
-EXPORT_TIMEOUT = 600          # fulfillment_detail export can be slow
+EXPORT_TIMEOUT = 600          # Export generation can be slow
 EXPORT_MAX_RETRIES = 3
+ROLLING_WINDOW_DAYS = int(os.environ.get("ROLLING_WINDOW_DAYS", 5))
 
-WAREHOUSE_ID = "7cc6cf47-973c-485c-b605-0e2ae40ec1d6"
-TENANT_ID = "7b25e5bd-f47c-42ae-bf10-660e9fdbf78f"
-REQUEST_ID = "8d3ec4e2-50bb-47c4-a257-f1cc5e635ad1"
-FF_EXPORT_URL = "https://api.freshfactory.id/v1/admin/exports"
+# Configurable Sheet Tabs & Timezone (avoids leaking internal naming in code)
+WMS_SHEET_NAME = os.environ.get("WMS_SHEET_NAME", "Fulfillment")
+TMS_SHEET_NAME = os.environ.get("TMS_SHEET_NAME", "Shipments")
+CACHE_SHEET_NAME = os.environ.get("CACHE_SHEET_NAME", "Cache_Data")
+LOCAL_TIMEZONE = os.environ.get("LOCAL_TIMEZONE", "Asia/Jakarta")
 
-TMS_BASE_HOST = "https://tms.frex.co.id"
-TMS_LOGIN_URL = f"{TMS_BASE_HOST}/en/admin/login"
-TMS_SHIPMENTS_URL = f"{TMS_BASE_HOST}/en/admin/shipments/shipments"
 TMS_COOKIE_JAR_FILE = Path(__file__).parent / "session_cookies.pkl"
 TMS_LOGIN_EMAIL_FIELD = "email"
 TMS_LOGIN_PASSWORD_FIELD = "password"
 TMS_LOGIN_TOKEN_FIELD = "_token"
 
-FULFILLMENT_SHEET_NAME = "Fulfillment"
-FREX_SHEET_NAME = "Frex"
-CACHE_SHEET_NAME = "Cache_Data"
 
-# Both Fulfillment and Frex now pull the SAME rolling window: today - N days
-# through today. Change this one constant to adjust both at once.
-ROLLING_WINDOW_DAYS = 5
+def get_required_env(var_name: str) -> str:
+    val = os.environ.get(var_name)
+    if not val:
+        print(f"FATAL: Required environment variable '{var_name}' is missing or empty.")
+        sys.exit(1)
+    return val
 
 
 def load_config():
     """Validate env vars and set up API/Sheets clients. Exits with a clear
     message if anything required is missing or invalid."""
-    bearer_token = os.environ.get("BEARER_TOKEN")
-    if not bearer_token:
-        print("FATAL: env var 'BEARER_TOKEN' is missing/empty.")
+    # Support both new generic name and legacy name for smooth transition
+    wms_token = os.environ.get("WMS_BEARER_TOKEN") or os.environ.get("BEARER_TOKEN")
+    if not wms_token:
+        print("FATAL: env var 'WMS_BEARER_TOKEN' is missing/empty.")
         sys.exit(1)
 
-    tms_email = os.environ.get("TMS_EMAIL")
-    tms_password = os.environ.get("TMS_PASSWORD")
-    if not tms_email or not tms_password:
-        print("FATAL: env vars 'TMS_EMAIL' / 'TMS_PASSWORD' are missing/empty.")
-        sys.exit(1)
+    wms_cfg = {
+        "token": wms_token,
+        "export_url": get_required_env("WMS_EXPORT_URL").rstrip("/"),
+        "warehouse_id": get_required_env("WMS_WAREHOUSE_ID"),
+        "tenant_id": get_required_env("WMS_TENANT_ID"),
+        "request_id": get_required_env("WMS_REQUEST_ID"),
+    }
 
-    raw_service_account = os.environ.get("GOOGLE_SERVICE_ACCOUNT")
-    if not raw_service_account:
-        print("FATAL: env var 'GOOGLE_SERVICE_ACCOUNT' is missing/empty.")
-        sys.exit(1)
+    tms_base = get_required_env("TMS_BASE_HOST").rstrip("/")
+    tms_cfg = {
+        "base_host": tms_base,
+        "login_url": os.environ.get("TMS_LOGIN_URL", f"{tms_base}/en/admin/login"),
+        "shipments_url": os.environ.get("TMS_SHIPMENTS_URL", f"{tms_base}/en/admin/shipments/shipments"),
+        "email": get_required_env("TMS_EMAIL"),
+        "password": get_required_env("TMS_PASSWORD"),
+    }
+
+    raw_service_account = get_required_env("GOOGLE_SERVICE_ACCOUNT")
     try:
         service_account_info = json.loads(raw_service_account)
     except json.JSONDecodeError as e:
@@ -128,27 +146,20 @@ def load_config():
         except OSError:
             pass
 
-    spreadsheet_id = os.environ.get("SPREADSHEET_ID")
-    if not spreadsheet_id:
-        print("FATAL: env var 'SPREADSHEET_ID' is missing/empty. Set it to the spreadsheet's "
-              "ID from its URL (the part between /d/ and /edit).")
-        sys.exit(1)
+    spreadsheet_id = get_required_env("SPREADSHEET_ID")
     try:
         spreadsheet = gc.open_by_key(spreadsheet_id)
     except gspread.exceptions.SpreadsheetNotFound:
-        print(f"FATAL: spreadsheet '{spreadsheet_id}' not found (check SPREADSHEET_ID).")
+        print("FATAL: target spreadsheet not found (check SPREADSHEET_ID).")
         sys.exit(1)
     except PermissionError as e:
         service_account_email = service_account_info.get("client_email", "<unknown - check your JSON key>")
         print(
-            f"FATAL: no permission to open spreadsheet '{spreadsheet_id}' (HTTP 403).\n"
+            f"FATAL: no permission to open spreadsheet (HTTP 403).\n"
             f"Fix checklist:\n"
-            f"  1. Open the spreadsheet in your browser, click Share, and add this exact "
-            f"email as Editor:\n     {service_account_email}\n"
-            f"  2. Double-check SPREADSHEET_ID matches the ID in the sheet's URL "
-            f"(the part between /d/ and /edit).\n"
-            f"  3. In Google Cloud Console, confirm 'Google Sheets API' and 'Google Drive API' "
-            f"are both Enabled on the project this service account belongs to.\n"
+            f"  1. Share the spreadsheet with Editor access to: {service_account_email}\n"
+            f"  2. Double-check SPREADSHEET_ID matches the ID in the sheet's URL.\n"
+            f"  3. Confirm 'Google Sheets API' and 'Google Drive API' are enabled.\n"
             f"Original error: {e}"
         )
         sys.exit(1)
@@ -156,18 +167,18 @@ def load_config():
         print(f"FATAL: failed to open spreadsheet (Sheets API error): {e}")
         sys.exit(1)
 
-    return bearer_token, tms_email, tms_password, spreadsheet
+    return wms_cfg, tms_cfg, spreadsheet
 
 
-BEARER_TOKEN, TMS_EMAIL, TMS_PASSWORD, SPREADSHEET = load_config()
+WMS_CFG, TMS_CFG, SPREADSHEET = load_config()
 
-FF_HEADERS = {
+WMS_HEADERS = {
     "accept": "application/json",
-    "authorization": f"Bearer {BEARER_TOKEN}",
+    "authorization": f"Bearer {WMS_CFG['token']}",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 }
-FF_SESSION = requests.Session()
-FF_SESSION.headers.update(FF_HEADERS)
+WMS_SESSION = requests.Session()
+WMS_SESSION.headers.update(WMS_HEADERS)
 
 TMS_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -175,11 +186,6 @@ TMS_USER_AGENT = (
 )
 TMS_SEC_CH_UA = '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"'
 
-# Base headers a real Chrome browser sends on every request to this site,
-# regardless of whether it's a page navigation or a background XHR call.
-# Per-request Sec-Fetch-* / Accept / Referer are layered on top in
-# tms_login() and tms_fetch_range() to match what a browser actually sends
-# for a top-level navigation vs. an in-page fetch() call.
 TMS_HEADERS = {
     "User-Agent": TMS_USER_AGENT,
     "Accept-Language": "en-US,en;q=0.9",
@@ -212,22 +218,22 @@ TMS_COLUMNS = [
 
 
 # ==========================================
-# 2. FULFILLMENT (Fresh Factory export API)
+# 2. SOURCE A: WMS (Export API)
 # ==========================================
-def fulfillment_date_window():
-    """Rolling window: today - ROLLING_WINDOW_DAYS -> today (same window as Frex)."""
+def get_rolling_date_window():
+    """Rolling window: today - ROLLING_WINDOW_DAYS -> today."""
     today = datetime.now()
     start_date = (today - timedelta(days=ROLLING_WINDOW_DAYS)).strftime("%Y-%m-%d")
     end_date = today.strftime("%Y-%m-%d")
     return start_date, end_date
 
 
-def get_fresh_export_token():
-    url = f"{FF_EXPORT_URL}/generate_token"
+def get_wms_export_token():
+    url = f"{WMS_CFG['export_url']}/generate_token"
     last_error = None
     for attempt in range(1, 4):
         try:
-            response = FF_SESSION.get(url, timeout=REQUEST_TIMEOUT)
+            response = WMS_SESSION.get(url, timeout=REQUEST_TIMEOUT)
         except requests.exceptions.Timeout:
             last_error = "timeout"
         except requests.exceptions.RequestException as e:
@@ -245,21 +251,19 @@ def get_fresh_export_token():
                 last_error = f"HTTP {response.status_code}"
         if attempt < 3:
             time.sleep(2)
-    print(f"WARNING: failed to get export token after 3 attempts. Last error: {last_error}")
+    print(f"[WMS] WARNING: failed to get export token after 3 attempts. Last error: {last_error}")
     return None
 
 
-def fetch_fulfillment():
+def fetch_wms_data():
     """Returns (df_or_None, status_or_None). status is only set on failure
     or 'no new data'; None means df is good to write."""
-    import io
-
-    start_date, end_date = fulfillment_date_window()
-    print(f"[Fulfillment] window: {start_date} to {end_date}")
+    start_date, end_date = get_rolling_date_window()
+    print(f"[WMS] window: {start_date} to {end_date}")
     params = {
-        "type": "fulfillment_detail",
-        "warehouse_id": WAREHOUSE_ID,
-        "tenant_id": TENANT_ID,
+        "type": os.environ.get("WMS_EXPORT_TYPE", "fulfillment_detail"),
+        "warehouse_id": WMS_CFG["warehouse_id"],
+        "tenant_id": WMS_CFG["tenant_id"],
         "start_order_date_in": start_date,
         "end_order_date_in": end_date,
         "page": "1",
@@ -268,51 +272,51 @@ def fetch_fulfillment():
 
     last_status = None
     for attempt in range(1, EXPORT_MAX_RETRIES + 1):
-        token = get_fresh_export_token()
+        token = get_wms_export_token()
         if not token:
             return None, "Failed (Token Expired)"
 
         req_params = dict(params)
         req_params["token"] = token
-        req_params["id"] = REQUEST_ID
+        req_params["id"] = WMS_CFG["request_id"]
 
         try:
-            response = FF_SESSION.get(FF_EXPORT_URL, params=req_params, timeout=EXPORT_TIMEOUT)
+            response = WMS_SESSION.get(WMS_CFG["export_url"], params=req_params, timeout=EXPORT_TIMEOUT)
         except requests.exceptions.Timeout:
-            print(f"[Fulfillment] timeout after {EXPORT_TIMEOUT}s. Not auto-retrying "
+            print(f"[WMS] timeout after {EXPORT_TIMEOUT}s. Not auto-retrying "
                   f"(a retry would restart generation, not resume it).")
             return None, "Failed (Request Timeout)"
         except requests.exceptions.RequestException as e:
             last_status = "Failed (Connection Error)"
-            print(f"[Fulfillment] connection error (attempt {attempt}/{EXPORT_MAX_RETRIES}): {e}")
+            print(f"[WMS] connection error (attempt {attempt}/{EXPORT_MAX_RETRIES}): {e}")
         else:
             if response.status_code != 200:
                 last_status = f"Failed (API Error {response.status_code})"
                 if response.status_code < 500:
-                    print(f"[Fulfillment] HTTP {response.status_code} - not retrying.")
+                    print(f"[WMS] HTTP {response.status_code} - not retrying.")
                     return None, last_status
-                print(f"[Fulfillment] HTTP {response.status_code} (attempt {attempt}/{EXPORT_MAX_RETRIES}).")
+                print(f"[WMS] HTTP {response.status_code} (attempt {attempt}/{EXPORT_MAX_RETRIES}).")
             else:
                 try:
                     df = pd.read_excel(io.BytesIO(response.content))
                 except Exception as e:
-                    print(f"[Fulfillment] failed to parse Excel response: {e}")
+                    print(f"[WMS] failed to parse Excel response: {e}")
                     return None, "Failed (Invalid Excel Response)"
                 if df.empty:
-                    print("[Fulfillment] no new data for this period.")
+                    print("[WMS] no new data for this period.")
                     return None, "Successful (No New Data)"
                 return df, None
 
         if attempt < EXPORT_MAX_RETRIES:
             delay = 5 * attempt
-            print(f"[Fulfillment] retrying in {delay}s...")
+            print(f"[WMS] retrying in {delay}s...")
             time.sleep(delay)
 
     return None, last_status or "Failed (Unknown Error)"
 
 
 # ==========================================
-# 3. FREX (TMS DataTables endpoint)
+# 3. SOURCE B: TMS (DataTables Endpoint)
 # ==========================================
 def tms_save_cookies():
     with open(TMS_COOKIE_JAR_FILE, "wb") as f:
@@ -331,9 +335,9 @@ def tms_load_cookies() -> bool:
 
 
 def tms_login():
-    # A real browser doesn't jump straight to the login endpoint - it lands
-    # on the homepage first, which is also where the session/CSRF cookie
-    # usually first gets set. Mirror that instead of hitting /login cold.
+    base_host = TMS_CFG["base_host"]
+    login_url = TMS_CFG["login_url"]
+
     nav_headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Sec-Fetch-Dest": "document",
@@ -343,21 +347,18 @@ def tms_login():
         "Upgrade-Insecure-Requests": "1",
     }
 
-    print(f"[Frex] visiting homepage {TMS_BASE_HOST} ...")
-    TMS_SESSION.get(TMS_BASE_HOST, headers=nav_headers, timeout=30)
-    time.sleep(random.uniform(0.6, 1.4))  # a human doesn't click instantly
+    print("[TMS] visiting portal homepage ...")
+    TMS_SESSION.get(base_host, headers=nav_headers, timeout=30)
+    time.sleep(random.uniform(0.6, 1.4))
 
-    print(f"[Frex] logging in fresh via {TMS_LOGIN_URL} ...")
+    print("[TMS] authenticating session ...")
     resp = TMS_SESSION.get(
-        TMS_LOGIN_URL,
-        headers={**nav_headers, "Sec-Fetch-Site": "same-origin", "Referer": TMS_BASE_HOST + "/"},
+        login_url,
+        headers={**nav_headers, "Sec-Fetch-Site": "same-origin", "Referer": base_host + "/"},
         timeout=30,
     )
     if resp.status_code == 404:
-        raise RuntimeError(
-            f"Login page not found (404) at {TMS_LOGIN_URL}. The TMS login path may have "
-            f"changed - open it in a browser and update TMS_LOGIN_URL in pipeline.py."
-        )
+        raise RuntimeError("TMS login page not found (404). Check TMS_LOGIN_URL / TMS_BASE_HOST.")
     resp.raise_for_status()
 
     token = None
@@ -368,17 +369,20 @@ def tms_login():
     if m:
         token = m.group(1)
 
-    payload = {TMS_LOGIN_EMAIL_FIELD: TMS_EMAIL, TMS_LOGIN_PASSWORD_FIELD: TMS_PASSWORD}
+    payload = {
+        TMS_LOGIN_EMAIL_FIELD: TMS_CFG["email"],
+        TMS_LOGIN_PASSWORD_FIELD: TMS_CFG["password"],
+    }
     if token:
         payload[TMS_LOGIN_TOKEN_FIELD] = token
 
-    time.sleep(random.uniform(0.8, 2.0))  # a human takes a moment to type credentials
+    time.sleep(random.uniform(0.8, 2.0))
 
     login_headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": TMS_BASE_HOST,
-        "Referer": TMS_LOGIN_URL,
+        "Origin": base_host,
+        "Referer": login_url,
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin",
@@ -388,21 +392,22 @@ def tms_login():
     if "XSRF-TOKEN" in TMS_SESSION.cookies:
         login_headers["X-XSRF-TOKEN"] = urllib.parse.unquote(TMS_SESSION.cookies["XSRF-TOKEN"])
 
-    resp = TMS_SESSION.post(TMS_LOGIN_URL, data=payload, headers=login_headers, timeout=30)
+    resp = TMS_SESSION.post(login_url, data=payload, headers=login_headers, timeout=30)
     resp.raise_for_status()
 
-    if "fresh_express_session" not in TMS_SESSION.cookies and resp.url == TMS_LOGIN_URL:
+    # Generic check: if we are still on the login URL after POSTing, authentication failed
+    if resp.url.rstrip("/") == login_url.rstrip("/"):
         raise RuntimeError(
             "Login did not appear to succeed (still on login page). Check "
-            "TMS_EMAIL/TMS_PASSWORD and the LOGIN_*_FIELD names."
+            "TMS_EMAIL/TMS_PASSWORD and form field names."
         )
     tms_save_cookies()
-    print("[Frex] login successful.")
+    print("[TMS] login successful.")
 
 
 def tms_ensure_authenticated():
     if tms_load_cookies():
-        print("[Frex] reusing saved session (if any survived from a previous step/cache).")
+        print("[TMS] reusing saved session cookies.")
     else:
         tms_login()
 
@@ -428,21 +433,19 @@ def tms_build_params(start, length, draw, date_start, date_end):
 
 
 def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
-                     retry_delay=2.0, allow_relogin=True):
+                    retry_delay=2.0, allow_relogin=True):
     rows = []
     start = 0
     draw = 1
     total = None
+    shipments_url = TMS_CFG["shipments_url"]
 
-    # A real browser loads the shipments page itself before its JS fires the
-    # first DataTables AJAX call - do the same instead of hitting the AJAX
-    # endpoint as the very first request after login.
-    if allow_relogin:  # only on the outermost call, not on relogin recursion
+    if allow_relogin:
         TMS_SESSION.get(
-            TMS_SHIPMENTS_URL,
+            shipments_url,
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Referer": TMS_BASE_HOST + "/",
+                "Referer": TMS_CFG["base_host"] + "/",
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "same-origin",
@@ -455,7 +458,7 @@ def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
 
     xhr_headers = {
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Referer": TMS_SHIPMENTS_URL,
+        "Referer": shipments_url,
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
@@ -469,7 +472,7 @@ def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
 
         for attempt in range(1, max_retries + 1):
             try:
-                resp = TMS_SESSION.get(TMS_SHIPMENTS_URL, params=params, headers=xhr_headers, timeout=30)
+                resp = TMS_SESSION.get(shipments_url, params=params, headers=xhr_headers, timeout=30)
             except requests.exceptions.Timeout:
                 last_error = "Request timed out."
             except requests.exceptions.ConnectionError:
@@ -479,10 +482,10 @@ def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
             else:
                 if resp.status_code in (401, 403, 419):
                     if allow_relogin:
-                        print(f"[Frex] session rejected (HTTP {resp.status_code}) - re-login and retry.")
+                        print(f"[TMS] session rejected (HTTP {resp.status_code}) - re-authenticating.")
                         tms_login()
                         return tms_fetch_range(date_start, date_end, page_size,
-                                                max_retries, retry_delay, allow_relogin=False)
+                                               max_retries, retry_delay, allow_relogin=False)
                     raise RuntimeError(f"Auth failed again (HTTP {resp.status_code}) after fresh login.")
                 if resp.status_code == 429:
                     last_error = "Rate limited (HTTP 429)."
@@ -494,10 +497,10 @@ def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
                     content_type = resp.headers.get("Content-Type", "")
                     if "application/json" not in content_type:
                         if allow_relogin:
-                            print("[Frex] non-JSON response (likely login redirect) - re-login and retry.")
+                            print("[TMS] non-JSON response (likely login redirect) - re-authenticating.")
                             tms_login()
                             return tms_fetch_range(date_start, date_end, page_size,
-                                                    max_retries, retry_delay, allow_relogin=False)
+                                                   max_retries, retry_delay, allow_relogin=False)
                         raise RuntimeError(f"Still non-JSON after fresh login ('{content_type}').")
                     try:
                         payload = resp.json()
@@ -507,7 +510,7 @@ def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
                         break
 
             if attempt < max_retries:
-                print(f"[Frex] attempt {attempt}/{max_retries} failed ({last_error}). Retrying in {retry_delay:.0f}s...")
+                print(f"[TMS] attempt {attempt}/{max_retries} failed ({last_error}). Retrying in {retry_delay:.0f}s...")
                 time.sleep(retry_delay)
 
         if payload is None:
@@ -520,44 +523,44 @@ def tms_fetch_range(date_start, date_end, page_size=100, max_retries=3,
 
         if total is None:
             total = payload.get("recordsTotal", 0)
-            print(f"[Frex] total records reported: {total}")
+            print(f"[TMS] total records reported: {total}")
             if total == 0:
                 break
 
         data = payload["data"]
         if not data:
-            print(f"[Frex] warning: no rows at offset {start} but total={total}. Stopping early.")
+            print(f"[TMS] warning: no rows at offset {start} but total={total}. Stopping early.")
             break
 
         rows.extend(data)
-        print(f"[Frex] fetched {len(rows)} / {total}")
+        print(f"[TMS] fetched {len(rows)} / {total}")
         start += page_size
         draw += 1
         if total is not None and start < total:
             time.sleep(random.uniform(0.3, 0.8))
 
     if total is not None and len(rows) != total:
-        print(f"[Frex] WARNING: fetched {len(rows)} rows but server reported {total}. Data may be incomplete.")
+        print(f"[TMS] WARNING: fetched {len(rows)} rows but server reported {total}. Data may be incomplete.")
 
     return rows
 
 
-def fetch_frex():
-    """Returns (df_or_None, status_or_None), mirroring fetch_fulfillment()."""
+def fetch_tms_data():
+    """Returns (df_or_None, status_or_None), mirroring fetch_wms_data()."""
     try:
         tms_ensure_authenticated()
         today = date.today()
         date_start = (today - timedelta(days=ROLLING_WINDOW_DAYS)).isoformat()
         date_end = today.isoformat()
-        print(f"[Frex] window: {date_start} to {date_end}")
+        print(f"[TMS] window: {date_start} to {date_end}")
         rows = tms_fetch_range(date_start, date_end)
     except Exception as e:
-        print("[Frex] failed:")
+        print("[TMS] failed:")
         print(traceback.format_exc())
         return None, f"Failed ({e})"
 
     if not rows:
-        print("[Frex] no rows returned for this window.")
+        print("[TMS] no rows returned for this window.")
         return None, "Successful (No New Data)"
 
     df = pd.DataFrame(rows)
@@ -566,8 +569,7 @@ def fetch_frex():
         before = len(df)
         df = df.drop_duplicates(subset="id", keep="last")
         if len(df) != before:
-            print(f"[Frex] dropped {before - len(df)} duplicate row(s) by 'id' "
-                  f"(expected when the table changes mid-pagination).")
+            print(f"[TMS] dropped {before - len(df)} duplicate row(s) by 'id'.")
 
     return df, None
 
@@ -618,10 +620,10 @@ def update_cache_log(category_name, status_message):
             cache_sheet = SPREADSHEET.worksheet(CACHE_SHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
             cache_sheet = SPREADSHEET.add_worksheet(title=CACHE_SHEET_NAME, rows="100", cols="3")
-            cache_sheet.append_row(["Category", "Last Updated (WIB)", "Last Run Status"])
+            cache_sheet.append_row(["Category", "Last Updated", "Last Run Status"])
 
-        wib_tz = pytz.timezone("Asia/Jakarta")
-        current_time_wib = datetime.now(wib_tz).strftime("%Y-%m-%d %H:%M:%S")
+        tz = pytz.timezone(LOCAL_TIMEZONE)
+        current_time_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
         try:
             cell = cache_sheet.find(category_name, in_column=1)
@@ -629,9 +631,9 @@ def update_cache_log(category_name, status_message):
             cell = None
 
         if cell is not None:
-            cache_sheet.update(f"B{cell.row}:C{cell.row}", [[current_time_wib, status_message]])
+            cache_sheet.update(f"B{cell.row}:C{cell.row}", [[current_time_str, status_message]])
         else:
-            cache_sheet.append_row([category_name, current_time_wib, status_message])
+            cache_sheet.append_row([category_name, current_time_str, status_message])
     except Exception:
         print(f"WARNING: failed to update {CACHE_SHEET_NAME} for '{category_name}':")
         print(traceback.format_exc())
@@ -692,22 +694,22 @@ def main():
     job_status = {}
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        fulfillment_future = executor.submit(fetch_fulfillment)
-        frex_future = executor.submit(fetch_frex)
-        fulfillment_df, fulfillment_status = fulfillment_future.result()
-        frex_df, frex_status = frex_future.result()
+        wms_future = executor.submit(fetch_wms_data)
+        tms_future = executor.submit(fetch_tms_data)
+        wms_df, wms_status = wms_future.result()
+        tms_df, tms_status = tms_future.result()
 
-    if fulfillment_status is not None:
-        update_cache_log(FULFILLMENT_SHEET_NAME, fulfillment_status)
-        job_status[FULFILLMENT_SHEET_NAME] = fulfillment_status.startswith("Successful")
+    if wms_status is not None:
+        update_cache_log(WMS_SHEET_NAME, wms_status)
+        job_status[WMS_SHEET_NAME] = wms_status.startswith("Successful")
     else:
-        job_status[FULFILLMENT_SHEET_NAME] = write_to_sheet(FULFILLMENT_SHEET_NAME, fulfillment_df)
+        job_status[WMS_SHEET_NAME] = write_to_sheet(WMS_SHEET_NAME, wms_df)
 
-    if frex_status is not None:
-        update_cache_log(FREX_SHEET_NAME, frex_status)
-        job_status[FREX_SHEET_NAME] = frex_status.startswith("Successful")
+    if tms_status is not None:
+        update_cache_log(TMS_SHEET_NAME, tms_status)
+        job_status[TMS_SHEET_NAME] = tms_status.startswith("Successful")
     else:
-        job_status[FREX_SHEET_NAME] = write_to_sheet(FREX_SHEET_NAME, frex_df)
+        job_status[TMS_SHEET_NAME] = write_to_sheet(TMS_SHEET_NAME, tms_df)
 
     print("=" * 50)
     print("SUMMARY:")
