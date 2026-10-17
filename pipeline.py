@@ -21,12 +21,12 @@ Header behaviour (applies to BOTH tabs, no hardcoded column list):
 
 Run target: CI/CD Runner (e.g., GitHub Actions).
 Required secrets / env vars:
-  WMS_BEARER_TOKEN       - WMS export API bearer token
+  WMS_BEARER_TOKEN       - WMS export API bearer token (or BEARER_TOKEN)
   WMS_EXPORT_URL         - Full base URL for the WMS export endpoint
   WMS_WAREHOUSE_ID       - Target warehouse UUID
   WMS_TENANT_ID          - Target tenant UUID
   WMS_REQUEST_ID         - Request identifier UUID
-  TMS_BASE_HOST          - Base URL for the TMS portal (e.g., https://tms.example.com)
+  TMS_BASE_HOST          - Base URL for the TMS portal
   TMS_EMAIL              - TMS login email
   TMS_PASSWORD           - TMS login password
   GOOGLE_SERVICE_ACCOUNT - JSON string of a Google service-account key
@@ -74,7 +74,6 @@ EXPORT_TIMEOUT = 600          # Export generation can be slow
 EXPORT_MAX_RETRIES = 3
 ROLLING_WINDOW_DAYS = int(os.environ.get("ROLLING_WINDOW_DAYS", 5))
 
-# Configurable Sheet Tabs & Timezone (cleaned of accidental quotes/whitespace)
 WMS_SHEET_NAME = os.environ.get("WMS_SHEET_NAME", "").strip().strip('"').strip("'") or "Fulfillment"
 TMS_SHEET_NAME = os.environ.get("TMS_SHEET_NAME", "").strip().strip('"').strip("'") or "Frex"
 CACHE_SHEET_NAME = os.environ.get("CACHE_SHEET_NAME", "").strip().strip('"').strip("'") or "Cache_Data"
@@ -87,13 +86,15 @@ TMS_LOGIN_TOKEN_FIELD = "_token"
 
 
 def clean_env(val: str) -> str:
-    """Strips accidental whitespace, quotes, and 'KEY=' prefixes from env vars."""
+    """Strips accidental whitespace, quotes, and Markdown link wrappers from env vars."""
     if not val:
         return ""
-    val = val.strip().strip('"').strip("'").strip()
-    if "=" in val and not val.startswith(("http://", "https://", "{")):
-        val = val.split("=", 1)[1].strip().strip('"').strip("'")
-    return val
+    val = val.strip()
+    # If pasted as a Markdown link [label](value), extract the value
+    md_match = re.search(r"\[([^\]]+)\]\(([^)]+)\)", val)
+    if md_match:
+        val = md_match.group(2).strip()
+    return val.strip('"').strip("'").strip()
 
 
 def get_required_env(var_name: str) -> str:
@@ -105,22 +106,25 @@ def get_required_env(var_name: str) -> str:
 
 
 def sanitize_url(var_name: str) -> str:
-    """Ensures a URL env var is clean and starts with https:// or http://."""
-    url = get_required_env(var_name).rstrip("/")
-    if "http://" in url or "https://" in url:
-        idx = url.find("https://") if "https://" in url else url.find("http://")
-        url = url[idx:]
-    else:
-        url = f"https://{url.lstrip('/')}"
-    return url
+    """Extracts a clean http(s) URL even if pasted as a Markdown link [url](url)."""
+    raw = os.environ.get(var_name, "").strip()
+    if not raw:
+        print(f"FATAL: Required environment variable '{var_name}' is missing or empty.")
+        sys.exit(1)
+    # Extract the first clean http:// or https:// URL, stopping at any Markdown/bracket/quote characters
+    match = re.search(r"https?://[^\s\]\)\[\"'<>]+", raw)
+    if match:
+        return match.group(0).rstrip("/")
+    cleaned = raw.strip("[]()\"' \t\r\n").rstrip("/")
+    return f"https://{cleaned.lstrip('/')}"
 
 
 def load_config():
     """Validate env vars and set up API/Sheets clients. Exits with a clear
     message if anything required is missing or invalid."""
-    wms_token = clean_env(os.environ.get("WMS_BEARER_TOKEN") or os.environ.get("BEARER_TOKEN") or "")
+    wms_token = (os.environ.get("WMS_BEARER_TOKEN") or os.environ.get("BEARER_TOKEN") or "").strip()
     if not wms_token:
-        print("FATAL: env var 'WMS_BEARER_TOKEN' is missing/empty.")
+        print("FATAL: env var 'WMS_BEARER_TOKEN' / 'BEARER_TOKEN' is missing/empty.")
         sys.exit(1)
 
     wms_cfg = {
@@ -132,15 +136,24 @@ def load_config():
     }
 
     tms_base = sanitize_url("TMS_BASE_HOST")
+    tms_login_env = os.environ.get("TMS_LOGIN_URL", "").strip()
+    tms_shipments_env = os.environ.get("TMS_SHIPMENTS_URL", "").strip()
+
     tms_cfg = {
         "base_host": tms_base,
-        "login_url": clean_env(os.environ.get("TMS_LOGIN_URL", "")) or f"{tms_base}/en/admin/login",
-        "shipments_url": clean_env(os.environ.get("TMS_SHIPMENTS_URL", "")) or f"{tms_base}/en/admin/shipments/shipments",
+        "login_url": sanitize_url("TMS_LOGIN_URL") if tms_login_env else f"{tms_base}/en/admin/login",
+        "shipments_url": sanitize_url("TMS_SHIPMENTS_URL") if tms_shipments_env else f"{tms_base}/en/admin/shipments/shipments",
         "email": get_required_env("TMS_EMAIL"),
-        "password": get_required_env("TMS_PASSWORD"),
+        "password": os.environ.get("TMS_PASSWORD", "").strip(),
     }
+    if not tms_cfg["password"]:
+        print("FATAL: Required environment variable 'TMS_PASSWORD' is missing or empty.")
+        sys.exit(1)
 
-    raw_service_account = get_required_env("GOOGLE_SERVICE_ACCOUNT")
+    raw_service_account = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "").strip()
+    if not raw_service_account:
+        print("FATAL: env var 'GOOGLE_SERVICE_ACCOUNT' is missing/empty.")
+        sys.exit(1)
     try:
         service_account_info = json.loads(raw_service_account)
     except json.JSONDecodeError as e:
